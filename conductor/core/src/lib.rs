@@ -1,11 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use rand::seq::SliceRandom;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 use uuid::Uuid;
 
 pub const SCHEMA_VERSION: i64 = 2;
@@ -156,22 +157,30 @@ pub fn ensure_home_dirs(home: &Path) -> Result<()> {
 pub fn connect(home: &Path) -> Result<Connection> {
     ensure_home_dirs(home)?;
     let path = db_path(home);
-    let conn = Connection::open(path)?;
+    let mut conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA foreign_keys = ON")?;
-    migrate(&conn)?;
+    conn.busy_timeout(Duration::from_secs(5))?;
+    migrate(&mut conn)?;
     Ok(conn)
 }
 
-pub fn migrate(conn: &Connection) -> Result<()> {
+pub fn migrate(conn: &mut Connection) -> Result<()> {
     let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version == SCHEMA_VERSION {
         return Ok(());
     }
 
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == SCHEMA_VERSION {
+        tx.commit()?;
+        return Ok(());
+    }
+
     if version == 0 {
-        conn.execute_batch(
+        tx.execute_batch(
             "
-            CREATE TABLE repos (
+            CREATE TABLE IF NOT EXISTS repos (
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 root_path TEXT NOT NULL,
@@ -181,10 +190,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
-            CREATE UNIQUE INDEX idx_repos_name ON repos(name);
-            CREATE UNIQUE INDEX idx_repos_root_path ON repos(root_path);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_name ON repos(name);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_root_path ON repos(root_path);
 
-            CREATE TABLE workspaces (
+            CREATE TABLE IF NOT EXISTS workspaces (
                 id TEXT PRIMARY KEY,
                 repository_id TEXT NOT NULL,
                 directory_name TEXT NOT NULL,
@@ -197,23 +206,25 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 FOREIGN KEY(repository_id) REFERENCES repos(id)
             );
 
-            CREATE UNIQUE INDEX idx_workspaces_repo_dir ON workspaces(repository_id, directory_name);
-            CREATE UNIQUE INDEX idx_workspaces_repo_branch ON workspaces(repository_id, branch);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_repo_dir ON workspaces(repository_id, directory_name);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_repo_branch ON workspaces(repository_id, branch);
 
             PRAGMA user_version = 2;
             ",
         )?;
+        tx.commit()?;
         return Ok(());
     }
 
     if version == 1 {
-        conn.execute_batch(
+        tx.execute_batch(
             "
             CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_name ON repos(name);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_root_path ON repos(root_path);
             PRAGMA user_version = 2;
             ",
         )?;
+        tx.commit()?;
         return Ok(());
     }
 
@@ -784,16 +795,22 @@ pub fn workspace_archive(conn: &Connection, workspace_ref: &str) -> Result<Archi
     let repo_root = PathBuf::from(repo.root_path);
     let ws_path = PathBuf::from(path);
     if ws_path.exists() {
-        let _ = run(
+        let status = git(&ws_path, &["status", "--porcelain", "--untracked-files=all"])?;
+        if !status.trim().is_empty() {
+            bail!(
+                "workspace has uncommitted changes; commit or stash before archiving: {}",
+                ws_path.display()
+            );
+        }
+        run(
             &[
                 "git".to_string(),
                 "worktree".to_string(),
                 "remove".to_string(),
-                "--force".to_string(),
                 ws_path.to_string_lossy().to_string(),
             ],
             Some(&repo_root),
-        );
+        )?;
     }
     let _ = run(
         &["git".to_string(), "worktree".to_string(), "prune".to_string()],
