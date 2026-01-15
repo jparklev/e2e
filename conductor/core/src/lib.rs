@@ -1,15 +1,17 @@
 use anyhow::{anyhow, bail, Context, Result};
 use rand::seq::SliceRandom;
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 const CITIES: &[&str] = &[
     "almaty",
@@ -103,6 +105,25 @@ const CITIES: &[&str] = &[
     "zurich",
 ];
 
+#[derive(Debug)]
+enum UserError {
+    Command { area: &'static str, command: String, message: String },
+    Database(String),
+    Filesystem(String),
+}
+
+impl fmt::Display for UserError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UserError::Command { area, command, message } => write!(f, "{area}: {message}\n$ {command}"),
+            UserError::Database(message) => write!(f, "db: {message}"),
+            UserError::Filesystem(message) => write!(f, "fs: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for UserError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Repo {
     pub id: String,
@@ -120,18 +141,69 @@ pub struct Workspace {
     pub name: String,
     pub branch: String,
     pub base_branch: String,
-    pub state: String,
+    pub state: WorkspaceState,
     pub path: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceState {
+    Ready,
+    Archived,
+    Error,
+}
+
+impl WorkspaceState {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorkspaceState::Ready => "ready",
+            WorkspaceState::Archived => "archived",
+            WorkspaceState::Error => "error",
+        }
+    }
+}
+
+impl fmt::Display for WorkspaceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Debug)]
+struct StateParseError(String);
+
+impl fmt::Display for StateParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid workspace state: {}", self.0)
+    }
+}
+
+impl std::error::Error for StateParseError {}
+
+impl FromSql for WorkspaceState {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        let value = value.as_str()?;
+        match value {
+            "ready" => Ok(WorkspaceState::Ready),
+            "archived" => Ok(WorkspaceState::Archived),
+            "error" => Ok(WorkspaceState::Error),
+            _ => Err(FromSqlError::Other(Box::new(StateParseError(value.to_string())))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveResult {
     pub id: String,
-    pub state: String,
+    pub ok: bool,
+    pub removed: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceChange {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
     pub path: String,
     pub status: String,
 }
@@ -149,36 +221,37 @@ pub fn db_path(home: &Path) -> PathBuf {
 }
 
 pub fn ensure_home_dirs(home: &Path) -> Result<()> {
-    std::fs::create_dir_all(home.join("repos"))?;
-    std::fs::create_dir_all(home.join("workspaces"))?;
+    fs(std::fs::create_dir_all(home.join("repos")))?;
+    fs(std::fs::create_dir_all(home.join("workspaces")))?;
     Ok(())
 }
 
 pub fn connect(home: &Path) -> Result<Connection> {
     ensure_home_dirs(home)?;
     let path = db_path(home);
-    let mut conn = Connection::open(path)?;
-    conn.execute_batch("PRAGMA foreign_keys = ON")?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    let mut conn = db(Connection::open(path))?;
+    db(conn.execute_batch("PRAGMA foreign_keys = ON"))?;
+    db(conn.execute_batch("PRAGMA journal_mode = WAL"))?;
+    db(conn.busy_timeout(Duration::from_secs(5)))?;
     migrate(&mut conn)?;
     Ok(conn)
 }
 
 pub fn migrate(conn: &mut Connection) -> Result<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let version: i64 = db(conn.query_row("PRAGMA user_version", [], |row| row.get(0)))?;
     if version == SCHEMA_VERSION {
         return Ok(());
     }
 
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let version: i64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let tx = db(conn.transaction_with_behavior(TransactionBehavior::Immediate))?;
+    let version: i64 = db(tx.query_row("PRAGMA user_version", [], |row| row.get(0)))?;
     if version == SCHEMA_VERSION {
-        tx.commit()?;
+        db(tx.commit())?;
         return Ok(());
     }
 
     if version == 0 {
-        tx.execute_batch(
+        db(tx.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS repos (
                 id TEXT PRIMARY KEY,
@@ -200,7 +273,7 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
                 path TEXT NOT NULL,
                 branch TEXT NOT NULL,
                 base_branch TEXT NOT NULL,
-                state TEXT NOT NULL DEFAULT 'ready',
+                state TEXT NOT NULL DEFAULT 'ready' CHECK(state IN ('ready', 'archived', 'error')),
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 FOREIGN KEY(repository_id) REFERENCES repos(id)
@@ -209,48 +282,116 @@ pub fn migrate(conn: &mut Connection) -> Result<()> {
             CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_repo_dir ON workspaces(repository_id, directory_name);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_repo_branch ON workspaces(repository_id, branch);
 
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             ",
-        )?;
-        tx.commit()?;
+        ))?;
+        db(tx.commit())?;
         return Ok(());
     }
 
     if version == 1 {
-        tx.execute_batch(
+        db(tx.execute_batch(
             "
             CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_name ON repos(name);
             CREATE UNIQUE INDEX IF NOT EXISTS idx_repos_root_path ON repos(root_path);
-            PRAGMA user_version = 2;
             ",
-        )?;
-        tx.commit()?;
+        ))?;
+    }
+
+    if version == 1 || version == 2 {
+        db(tx.execute_batch(
+            "
+            DROP TABLE IF EXISTS workspaces_new;
+            CREATE TABLE workspaces_new (
+                id TEXT PRIMARY KEY,
+                repository_id TEXT NOT NULL,
+                directory_name TEXT NOT NULL,
+                path TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                base_branch TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'ready' CHECK(state IN ('ready', 'archived', 'error')),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                FOREIGN KEY(repository_id) REFERENCES repos(id)
+            );
+
+            INSERT INTO workspaces_new (id, repository_id, directory_name, path, branch, base_branch, state, created_at, updated_at)
+            SELECT
+                id,
+                repository_id,
+                directory_name,
+                path,
+                branch,
+                base_branch,
+                CASE
+                    WHEN state IN ('ready', 'archived', 'error') THEN state
+                    ELSE 'error'
+                END,
+                created_at,
+                updated_at
+            FROM workspaces;
+
+            DROP TABLE workspaces;
+            ALTER TABLE workspaces_new RENAME TO workspaces;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_repo_dir ON workspaces(repository_id, directory_name);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workspaces_repo_branch ON workspaces(repository_id, branch);
+
+            PRAGMA user_version = 3;
+            ",
+        ))?;
+        db(tx.commit())?;
         return Ok(());
     }
 
     bail!("unsupported DB schema version: {version}");
 }
 
-fn run(cmd: &[String], cwd: Option<&Path>) -> Result<String> {
-    let mut command = Command::new(&cmd[0]);
-    command.args(&cmd[1..]);
+fn db<T>(result: std::result::Result<T, rusqlite::Error>) -> Result<T> {
+    result.map_err(|err| UserError::Database(err.to_string()).into())
+}
+
+fn fs<T>(result: std::result::Result<T, std::io::Error>) -> Result<T> {
+    result.map_err(|err| UserError::Filesystem(err.to_string()).into())
+}
+
+fn collect_rows<T>(rows: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>> {
+    db(rows.collect::<std::result::Result<Vec<_>, _>>())
+}
+
+fn format_command(cmd: &str, args: &[&str]) -> String {
+    let mut out = String::from(cmd);
+    for arg in args {
+        out.push(' ');
+        out.push_str(arg);
+    }
+    out
+}
+
+fn run(cmd: &str, args: &[&str], cwd: Option<&Path>) -> Result<String> {
+    let mut command = Command::new(cmd);
+    command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    let output = command.output().with_context(|| format!("failed to run {}", cmd.join(" ")))?;
+    let display = format_command(cmd, args);
+    let output = command.output().with_context(|| format!("failed to run {display}"))?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let msg = if !stderr.is_empty() { stderr } else if !stdout.is_empty() { stdout } else { "command failed".to_string() };
-    Err(anyhow!("{msg}\n$ {}", cmd.join(" ")))
+    Err(UserError::Command {
+        area: "git",
+        command: display,
+        message: msg,
+    }
+    .into())
 }
 
 fn git(repo_root: &Path, args: &[&str]) -> Result<String> {
-    let mut cmd = vec!["git".to_string()];
-    cmd.extend(args.iter().map(|arg| arg.to_string()));
-    run(&cmd, Some(repo_root))
+    run("git", args, Some(repo_root))
 }
 
 fn git_try(repo_root: &Path, args: &[&str]) -> Option<String> {
@@ -258,21 +399,11 @@ fn git_try(repo_root: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git_ref_exists(repo_root: &Path, full_ref: &str) -> bool {
-    Command::new("git")
-        .args(["show-ref", "--verify", "--quiet", full_ref])
-        .current_dir(repo_root)
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    git_try(repo_root, &["show-ref", "--verify", "--quiet", full_ref]).is_some()
 }
 
 fn resolve_repo_root(path: &Path) -> Result<PathBuf> {
-    let cmd = vec![
-        "git".to_string(),
-        "rev-parse".to_string(),
-        "--show-toplevel".to_string(),
-    ];
-    let out = run(&cmd, Some(path))?;
+    let out = git(path, &["rev-parse", "--show-toplevel"])?;
     let path = PathBuf::from(&out);
     Ok(path.canonicalize().unwrap_or_else(|_| PathBuf::from(out)))
 }
@@ -347,11 +478,11 @@ fn safe_workspace_relpath(path: &str) -> Result<PathBuf> {
 }
 
 fn auto_workspace_name(conn: &Connection, repo_id: &str) -> Result<String> {
-    let mut stmt = conn.prepare("SELECT directory_name FROM workspaces WHERE repository_id = ?")?;
-    let rows = stmt.query_map([repo_id], |row| row.get::<_, String>(0))?;
+    let mut stmt = db(conn.prepare("SELECT directory_name FROM workspaces WHERE repository_id = ?"))?;
+    let rows = db(stmt.query_map([repo_id], |row| row.get::<_, String>(0)))?;
     let mut used = HashSet::new();
     for row in rows {
-        used.insert(row?);
+        used.insert(db(row)?);
     }
     let mut rng = rand::thread_rng();
     for _ in 0..200 {
@@ -364,52 +495,33 @@ fn auto_workspace_name(conn: &Connection, repo_id: &str) -> Result<String> {
     Ok(format!("ws-{}", &Uuid::new_v4().to_string()[..8]))
 }
 
+fn repo_from_row(row: &Row) -> rusqlite::Result<Repo> {
+    Ok(Repo {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        root_path: row.get(2)?,
+        default_branch: row.get(3)?,
+        remote_url: row.get(4)?,
+    })
+}
+
 fn get_repo(conn: &Connection, repo_ref: &str) -> Result<Repo> {
-    let mut stmt = conn.prepare("SELECT id, name, root_path, default_branch, remote_url FROM repos WHERE id = ?")?;
-    if let Some(repo) = stmt
-        .query_row([repo_ref], |row| {
-            Ok(Repo {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                root_path: row.get(2)?,
-                default_branch: row.get(3)?,
-                remote_url: row.get(4)?,
-            })
-        })
-        .optional()?
+    let mut stmt = db(conn.prepare("SELECT id, name, root_path, default_branch, remote_url FROM repos WHERE id = ?"))?;
+    if let Some(repo) = db(stmt.query_row([repo_ref], repo_from_row).optional())?
     {
         return Ok(repo);
     }
 
-    let mut stmt = conn.prepare("SELECT id, name, root_path, default_branch, remote_url FROM repos WHERE name = ?")?;
-    if let Some(repo) = stmt
-        .query_row([repo_ref], |row| {
-            Ok(Repo {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                root_path: row.get(2)?,
-                default_branch: row.get(3)?,
-                remote_url: row.get(4)?,
-            })
-        })
-        .optional()?
+    let mut stmt = db(conn.prepare("SELECT id, name, root_path, default_branch, remote_url FROM repos WHERE name = ?"))?;
+    if let Some(repo) = db(stmt.query_row([repo_ref], repo_from_row).optional())?
     {
         return Ok(repo);
     }
 
     let like = format!("{repo_ref}%");
-    let mut stmt = conn.prepare("SELECT id, name, root_path, default_branch, remote_url FROM repos WHERE id LIKE ?")?;
-    let rows: Vec<Repo> = stmt
-        .query_map([like], |row| {
-            Ok(Repo {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                root_path: row.get(2)?,
-                default_branch: row.get(3)?,
-                remote_url: row.get(4)?,
-            })
-        })?
-        .collect::<std::result::Result<_, _>>()?;
+    let mut stmt = db(conn.prepare("SELECT id, name, root_path, default_branch, remote_url FROM repos WHERE id LIKE ?"))?;
+    let rows = db(stmt.query_map([like], repo_from_row))?;
+    let rows = collect_rows(rows)?;
     if rows.len() == 1 {
         return Ok(rows[0].clone());
     }
@@ -419,24 +531,53 @@ fn get_repo(conn: &Connection, repo_ref: &str) -> Result<Repo> {
     bail!("repo not found: {repo_ref}");
 }
 
-fn get_workspace(conn: &Connection, ws_ref: &str) -> Result<(String, String, String, String)> {
-    let mut stmt = conn.prepare("SELECT id, repository_id, path, branch FROM workspaces WHERE id = ?")?;
-    if let Some(row) = stmt
-        .query_row([ws_ref], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
-        .optional()?
-    {
+#[derive(Clone)]
+struct WorkspaceRow {
+    id: String,
+    path: String,
+    base_branch: String,
+    repo_root: String,
+}
+
+fn workspace_row_from_row(row: &Row) -> rusqlite::Result<WorkspaceRow> {
+    Ok(WorkspaceRow {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        base_branch: row.get(2)?,
+        repo_root: row.get(3)?,
+    })
+}
+
+fn get_workspace(conn: &Connection, ws_ref: &str) -> Result<WorkspaceRow> {
+    let sql = "\
+        SELECT \
+            w.id, \
+            w.path, \
+            w.base_branch, \
+            r.root_path \
+        FROM workspaces w \
+        JOIN repos r ON r.id = w.repository_id \
+        WHERE w.id = ?\
+    ";
+    let mut stmt = db(conn.prepare(sql))?;
+    if let Some(row) = db(stmt.query_row([ws_ref], workspace_row_from_row).optional())? {
         return Ok(row);
     }
 
     let like = format!("{ws_ref}%");
-    let mut stmt = conn.prepare("SELECT id, repository_id, path, branch FROM workspaces WHERE id LIKE ?")?;
-    let rows: Vec<(String, String, String, String)> = stmt
-        .query_map([like], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })?
-        .collect::<std::result::Result<_, _>>()?;
+    let sql = "\
+        SELECT \
+            w.id, \
+            w.path, \
+            w.base_branch, \
+            r.root_path \
+        FROM workspaces w \
+        JOIN repos r ON r.id = w.repository_id \
+        WHERE w.id LIKE ?\
+    ";
+    let mut stmt = db(conn.prepare(sql))?;
+    let rows = db(stmt.query_map([like], workspace_row_from_row))?;
+    let rows = collect_rows(rows)?;
     if rows.len() == 1 {
         return Ok(rows[0].clone());
     }
@@ -453,27 +594,17 @@ struct WorkspaceContext {
 }
 
 fn workspace_context(conn: &Connection, ws_ref: &str) -> Result<WorkspaceContext> {
-    let (ws_id, repo_id, path, _branch) = get_workspace(conn, ws_ref)?;
-    let base_branch: String = conn.query_row(
-        "SELECT base_branch FROM workspaces WHERE id = ?",
-        [ws_id],
-        |row| row.get(0),
-    )?;
-    let repo_root: String = conn.query_row(
-        "SELECT root_path FROM repos WHERE id = ?",
-        [repo_id],
-        |row| row.get(0),
-    )?;
+    let ws = get_workspace(conn, ws_ref)?;
     Ok(WorkspaceContext {
-        repo_root: PathBuf::from(repo_root),
-        base_branch,
-        path: PathBuf::from(path),
+        repo_root: PathBuf::from(ws.repo_root),
+        base_branch: ws.base_branch,
+        path: PathBuf::from(ws.path),
     })
 }
 
 pub fn workspace_path(conn: &Connection, ws_ref: &str) -> Result<PathBuf> {
-    let (_id, _repo_id, path, _branch) = get_workspace(conn, ws_ref)?;
-    Ok(PathBuf::from(path))
+    let ws = get_workspace(conn, ws_ref)?;
+    Ok(PathBuf::from(ws.path))
 }
 
 pub fn init(home: &Path) -> Result<PathBuf> {
@@ -485,26 +616,18 @@ pub fn repo_add(conn: &Connection, path: &Path, name: Option<&str>, default_bran
     let repo_root = resolve_repo_root(path)?;
     let root_str = repo_root.to_string_lossy().to_string();
 
-    let mut stmt = conn.prepare("SELECT id, name, root_path, default_branch, remote_url FROM repos WHERE root_path = ?")?;
-    if let Some(repo) = stmt
-        .query_row([root_str.clone()], |row| {
-            Ok(Repo {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                root_path: row.get(2)?,
-                default_branch: row.get(3)?,
-                remote_url: row.get(4)?,
-            })
-        })
-        .optional()?
-    {
+    let mut stmt = db(conn.prepare("SELECT id, name, root_path, default_branch, remote_url FROM repos WHERE root_path = ?"))?;
+    if let Some(repo) = db(stmt.query_row([root_str.clone()], repo_from_row).optional())? {
         return Ok(repo);
     }
 
     let name = name.map(|s| s.to_string()).unwrap_or_else(|| repo_root.file_name().unwrap_or_default().to_string_lossy().to_string());
-    let by_name: Option<(String, String)> = conn
-        .query_row("SELECT id, root_path FROM repos WHERE name = ?", [name.clone()], |row| Ok((row.get(0)?, row.get(1)?)))
-        .optional()?;
+    let by_name: Option<(String, String)> = db(
+        conn.query_row("SELECT id, root_path FROM repos WHERE name = ?", [name.clone()], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .optional(),
+    )?;
     if let Some((_, path)) = by_name {
         bail!("repo name already registered: {name} ({path})");
     }
@@ -517,10 +640,10 @@ pub fn repo_add(conn: &Connection, path: &Path, name: Option<&str>, default_bran
     };
 
     let repo_id = Uuid::new_v4().to_string();
-    conn.execute(
+    db(conn.execute(
         "INSERT INTO repos (id, name, root_path, default_branch, remote_url) VALUES (?, ?, ?, ?, ?)",
         params![repo_id, name, root_str, default_branch, remote_url],
-    )?;
+    ))?;
 
     Ok(Repo {
         id: repo_id,
@@ -554,30 +677,19 @@ pub fn repo_add_url(
         }
         bail!("repo path already exists: {}", repo_dir.display());
     }
-    let cmd = vec![
-        "git".to_string(),
-        "clone".to_string(),
-        url.to_string(),
-        repo_dir.to_string_lossy().to_string(),
-    ];
-    run(&cmd, Some(home))?;
+    let repo_dir_str = repo_dir.to_string_lossy().to_string();
+    let args = ["clone", url, repo_dir_str.as_str()];
+    if let Err(err) = run("git", &args, Some(home)) {
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        return Err(err);
+    }
     repo_add(conn, &repo_dir, Some(&display_name), default_branch)
 }
 
 pub fn repo_list(conn: &Connection) -> Result<Vec<Repo>> {
-    let mut stmt = conn.prepare("SELECT id, name, root_path, default_branch, remote_url FROM repos ORDER BY created_at DESC")?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok(Repo {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                root_path: row.get(2)?,
-                default_branch: row.get(3)?,
-                remote_url: row.get(4)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+    let mut stmt = db(conn.prepare("SELECT id, name, root_path, default_branch, remote_url FROM repos ORDER BY created_at DESC"))?;
+    let rows = db(stmt.query_map([], repo_from_row))?;
+    collect_rows(rows)
 }
 
 pub fn workspace_create(
@@ -607,50 +719,41 @@ pub fn workspace_create(
     if workspace_path.exists() {
         bail!("workspace path already exists: {}", workspace_path.display());
     }
-    std::fs::create_dir_all(workspace_path.parent().ok_or_else(|| anyhow!("invalid workspace path"))?)?;
+    fs(std::fs::create_dir_all(
+        workspace_path
+            .parent()
+            .ok_or_else(|| anyhow!("invalid workspace path"))?,
+    ))?;
+    let workspace_path_str = workspace_path.to_string_lossy().to_string();
 
     if git_ref_exists(&repo_root, &format!("refs/heads/{branch}")) {
-        let cmd = vec![
-            "git".to_string(),
-            "worktree".to_string(),
-            "add".to_string(),
-            workspace_path.to_string_lossy().to_string(),
-            branch.clone(),
-        ];
-        run(&cmd, Some(&repo_root))?;
+        let args = ["worktree", "add", "--", workspace_path_str.as_str(), branch.as_str()];
+        run("git", &args, Some(&repo_root))?;
     } else {
-        let cmd = vec![
-            "git".to_string(),
-            "worktree".to_string(),
-            "add".to_string(),
-            "-b".to_string(),
-            branch.clone(),
-            workspace_path.to_string_lossy().to_string(),
-            base_ref.clone(),
+        let args = [
+            "worktree",
+            "add",
+            "-b",
+            branch.as_str(),
+            "--",
+            workspace_path_str.as_str(),
+            base_ref.as_str(),
         ];
-        run(&cmd, Some(&repo_root))?;
+        run("git", &args, Some(&repo_root))?;
     }
 
     let ws_id = Uuid::new_v4().to_string();
-    let insert = conn.execute(
+    let insert = db(conn.execute(
         "
         INSERT INTO workspaces (id, repository_id, directory_name, path, branch, base_branch, state)
         VALUES (?, ?, ?, ?, ?, ?, 'ready')
         ",
-        params![ws_id, repo.id, name, workspace_path.to_string_lossy().to_string(), branch, base_ref.clone()],
-    );
+        params![ws_id, repo.id, name, workspace_path_str.clone(), branch, base_ref.clone()],
+    ));
 
     if let Err(err) = insert {
-        let _ = run(
-            &[
-                "git".to_string(),
-                "worktree".to_string(),
-                "remove".to_string(),
-                "--force".to_string(),
-                workspace_path.to_string_lossy().to_string(),
-            ],
-            Some(&repo_root),
-        );
+        let args = ["worktree", "remove", "--force", "--", workspace_path_str.as_str()];
+        let _ = run("git", &args, Some(&repo_root));
         return Err(err.into());
     }
 
@@ -661,8 +764,8 @@ pub fn workspace_create(
         name,
         branch,
         base_branch: base_ref,
-        state: "ready".to_string(),
-        path: workspace_path.to_string_lossy().to_string(),
+        state: WorkspaceState::Ready,
+        path: workspace_path_str,
     })
 }
 
@@ -691,32 +794,29 @@ pub fn workspace_list(conn: &Connection, repo_filter: Option<&str>) -> Result<Ve
     }
     sql.push_str(" ORDER BY w.created_at DESC");
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
-            Ok(Workspace {
-                id: row.get(0)?,
-                repo_id: row.get(1)?,
-                repo: row.get(2)?,
-                name: row.get(3)?,
-                branch: row.get(4)?,
-                base_branch: row.get(5)?,
-                state: row.get(6)?,
-                path: row.get(7)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
+    let mut stmt = db(conn.prepare(&sql))?;
+    let rows = db(stmt.query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
+        Ok(Workspace {
+            id: row.get(0)?,
+            repo_id: row.get(1)?,
+            repo: row.get(2)?,
+            name: row.get(3)?,
+            branch: row.get(4)?,
+            base_branch: row.get(5)?,
+            state: row.get(6)?,
+            path: row.get(7)?,
+        })
+    }))?;
+    collect_rows(rows)
 }
 
 pub fn workspace_files(conn: &Connection, ws_ref: &str) -> Result<Vec<String>> {
     let context = workspace_context(conn, ws_ref)?;
-    let tracked = git(&context.path, &["ls-files"])?;
+    let tracked = git(&context.path, &["ls-files", "-z"])?;
     let mut files: Vec<String> = tracked
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_string)
+        .split('\0')
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| entry.to_string())
         .collect();
     files.sort();
     files.dedup();
@@ -732,21 +832,38 @@ pub fn workspace_changes(conn: &Connection, ws_ref: &str) -> Result<Vec<Workspac
             "diff",
             "--name-status",
             "--no-color",
+            "-z",
             &format!("{base_ref}...HEAD"),
         ],
     )?;
     let mut changes = Vec::new();
-    for line in diff.lines() {
-        if line.trim().is_empty() {
-            continue;
+    let mut parts = diff.split('\0').filter(|part| !part.is_empty());
+    while let Some(status) = parts.next() {
+        if status.starts_with('R') || status.starts_with('C') {
+            let old_path = match parts.next() {
+                Some(path) => path,
+                None => break,
+            };
+            let new_path = match parts.next() {
+                Some(path) => path,
+                None => break,
+            };
+            changes.push(WorkspaceChange {
+                old_path: Some(old_path.to_string()),
+                path: new_path.to_string(),
+                status: status.to_string(),
+            });
+        } else {
+            let path = match parts.next() {
+                Some(path) => path,
+                None => break,
+            };
+            changes.push(WorkspaceChange {
+                old_path: None,
+                path: path.to_string(),
+                status: status.to_string(),
+            });
         }
-        let parts: Vec<&str> = line.split('\t').collect();
-        if parts.len() < 2 {
-            continue;
-        }
-        let status = parts[0].to_string();
-        let path = parts.last().unwrap().to_string();
-        changes.push(WorkspaceChange { path, status });
     }
     Ok(changes)
 }
@@ -755,7 +872,7 @@ pub fn workspace_file_content(conn: &Connection, ws_ref: &str, file_path: &str) 
     let context = workspace_context(conn, ws_ref)?;
     let rel = safe_workspace_relpath(file_path)?;
     let full_path = context.path.join(rel);
-    let bytes = std::fs::read(&full_path)?;
+    let bytes = fs(std::fs::read(&full_path))?;
     String::from_utf8(bytes).map_err(|_| anyhow!("file is not valid utf-8"))
 }
 
@@ -777,24 +894,12 @@ pub fn workspace_file_diff(conn: &Connection, ws_ref: &str, file_path: &str) -> 
 }
 
 pub fn workspace_archive(conn: &Connection, workspace_ref: &str, force: bool) -> Result<ArchiveResult> {
-    let (ws_id, repo_id, path, _branch) = get_workspace(conn, workspace_ref)?;
-    let repo: Repo = conn.query_row(
-        "SELECT id, name, root_path, default_branch, remote_url FROM repos WHERE id = ?",
-        [repo_id],
-        |row| {
-            Ok(Repo {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                root_path: row.get(2)?,
-                default_branch: row.get(3)?,
-                remote_url: row.get(4)?,
-            })
-        },
-    )?;
-
-    let repo_root = PathBuf::from(repo.root_path);
-    let ws_path = PathBuf::from(path);
+    let ws = get_workspace(conn, workspace_ref)?;
+    let ws_id = ws.id.clone();
+    let repo_root = PathBuf::from(ws.repo_root);
+    let ws_path = PathBuf::from(ws.path);
     let mut removed = false;
+    let mut message = "archived".to_string();
     if ws_path.exists() {
         if !force {
             let status = git(&ws_path, &["status", "--porcelain", "--untracked-files=all"])?;
@@ -805,35 +910,31 @@ pub fn workspace_archive(conn: &Connection, workspace_ref: &str, force: bool) ->
                 );
             }
         }
-        let mut cmd = vec![
-            "git".to_string(),
-            "worktree".to_string(),
-            "remove".to_string(),
-        ];
+        let mut args = vec!["worktree", "remove"];
         if force {
-            cmd.push("--force".to_string());
+            args.push("--force");
         }
-        cmd.push(ws_path.to_string_lossy().to_string());
-        run(&cmd, Some(&repo_root))?;
+        let ws_path_str = ws_path.to_string_lossy().to_string();
+        args.push("--");
+        args.push(ws_path_str.as_str());
+        run("git", &args, Some(&repo_root))?;
         removed = true;
+    } else {
+        message = "workspace path already removed".to_string();
     }
-    let prune = run(
-        &["git".to_string(), "worktree".to_string(), "prune".to_string()],
-        Some(&repo_root),
-    );
-    if let Err(err) = prune {
-        if removed {
-            return Err(err);
-        }
+    if let Err(err) = run("git", &["worktree", "prune"], Some(&repo_root)) {
+        message = format!("{message} (prune failed: {err})");
     }
 
-    conn.execute(
-        "UPDATE workspaces SET state = 'archived', updated_at = datetime('now') WHERE id = ?",
-        [ws_id.clone()],
-    )?;
+    db(conn.execute(
+        "UPDATE workspaces SET state = ?, updated_at = datetime('now') WHERE id = ?",
+        [WorkspaceState::Archived.as_str(), ws_id.as_str()],
+    ))?;
 
     Ok(ArchiveResult {
         id: ws_id,
-        state: "archived".to_string(),
+        ok: true,
+        removed,
+        message,
     })
 }

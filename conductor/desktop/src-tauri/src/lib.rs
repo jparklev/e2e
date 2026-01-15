@@ -151,6 +151,12 @@ fn workspace_file_diff(home: Option<String>, workspace: String, path: String) ->
 }
 
 #[tauri::command]
+fn resolve_home_path(home: Option<String>) -> Result<String, String> {
+    let home = resolve_home(home)?;
+    Ok(home.to_string_lossy().to_string())
+}
+
+#[tauri::command]
 fn parse_agent_lines(lines: Vec<String>) -> Result<Vec<Value>, String> {
     let mut parser = AgentParser::new();
     let mut out = Vec::new();
@@ -181,6 +187,7 @@ pub fn run() {
             workspace_changes,
             workspace_file_content,
             workspace_file_diff,
+            resolve_home_path,
             parse_agent_lines
         ])
         .run(tauri::generate_context!())

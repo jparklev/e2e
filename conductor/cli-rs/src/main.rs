@@ -229,7 +229,11 @@ fn main() -> Result<()> {
                         print_json(&changes)?;
                     } else {
                         for change in changes {
-                            println!("{}\t{}", change.status, change.path);
+                            if let Some(old_path) = change.old_path {
+                                println!("{}\t{}\t{}", change.status, old_path, change.path);
+                            } else {
+                                println!("{}\t{}", change.status, change.path);
+                            }
                         }
                     }
                 }
@@ -314,6 +318,58 @@ fn pump_lines(stream: impl std::io::Read + Send + 'static, kind: &'static str, t
     });
 }
 
+struct ResumePattern {
+    engine: &'static str,
+    regex: Regex,
+}
+
+struct ResumeEvent {
+    engine: &'static str,
+    token: String,
+}
+
+fn resume_patterns() -> Result<Vec<ResumePattern>> {
+    Ok(vec![
+        ResumePattern {
+            engine: "codex",
+            regex: Regex::new(r"(?i)`?codex\s+resume\s+(?P<token>[^`\s]+)`?")?,
+        },
+        ResumePattern {
+            engine: "claude",
+            regex: Regex::new(r"(?i)`?claude\s+(?:--resume|-r)\s+(?P<token>[^`\s]+)`?")?,
+        },
+    ])
+}
+
+fn extract_resume_tokens(line: &str, patterns: &[ResumePattern]) -> Vec<ResumeEvent> {
+    let mut events = Vec::new();
+    for pattern in patterns {
+        for caps in pattern.regex.captures_iter(line) {
+            if let Some(token) = caps.name("token").map(|m| m.as_str()) {
+                events.push(ResumeEvent {
+                    engine: pattern.engine,
+                    token: token.to_string(),
+                });
+            }
+        }
+    }
+    events
+}
+
+fn route_stdout_line(parser: &mut AgentParser, line: &str) -> Vec<Value> {
+    let value: Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    if let Some(events) = parser.parse_value(&value) {
+        return events;
+    }
+    if value.is_object() || value.is_array() {
+        return vec![json!({"type": "json", "data": value})];
+    }
+    Vec::new()
+}
+
 fn exec_json(cmd: &[String], cwd: Option<&Path>) -> Result<i32> {
     let mut command = Command::new(&cmd[0]);
     command.args(&cmd[1..]);
@@ -336,11 +392,7 @@ fn exec_json(cmd: &[String], cwd: Option<&Path>) -> Result<i32> {
         "cwd": cwd.map(|p| p.to_string_lossy().to_string()),
     }))?;
 
-    let patterns = vec![
-        ("codex", Regex::new(r"(?i)`?codex\s+resume\s+(?P<token>[^`\s]+)`?")?),
-        ("claude", Regex::new(r"(?i)`?claude\s+(?:--resume|-r)\s+(?P<token>[^`\s]+)`?")?),
-    ];
-
+    let patterns = resume_patterns()?;
     let mut parser = AgentParser::new();
     let mut closed = 0;
     while closed < 2 {
@@ -350,30 +402,21 @@ fn exec_json(cmd: &[String], cwd: Option<&Path>) -> Result<i32> {
                 closed += 1;
             }
             Some(line) => {
-                for (engine, pattern) in &patterns {
-                    for caps in pattern.captures_iter(&line) {
-                        if let Some(token) = caps.name("token").map(|m| m.as_str()) {
-                            print_json_value(&json!({
-                                "type": "resume",
-                                "engine": engine,
-                                "token": token,
-                            }))?;
-                        }
-                    }
+                for resume in extract_resume_tokens(&line, &patterns) {
+                    print_json_value(&json!({
+                        "type": "resume",
+                        "engine": resume.engine,
+                        "token": resume.token,
+                    }))?;
                 }
 
                 if event.kind == "stdout" {
-                    if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                        if let Some(events) = parser.parse_value(&value) {
-                            for event in events {
-                                print_json_value(&event)?;
-                            }
-                            continue;
+                    let routed = route_stdout_line(&mut parser, &line);
+                    if !routed.is_empty() {
+                        for event in routed {
+                            print_json_value(&event)?;
                         }
-                        if value.is_object() || value.is_array() {
-                            print_json_value(&json!({"type": "json", "data": value}))?;
-                            continue;
-                        }
+                        continue;
                     }
                 }
 

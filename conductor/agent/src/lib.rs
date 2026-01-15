@@ -506,7 +506,7 @@ fn parse_claude_event(value: &Value, state: &mut ClaudeState) -> Option<Vec<Valu
                 }
             }
             if !text_parts.is_empty() {
-                events.push(message_event("claude", &text_parts.join("")));
+                events.push(message_event("claude", &text_parts.join("\n")));
             }
             Some(events)
         }
@@ -542,33 +542,72 @@ fn tool_input_path(tool_input: &Map<String, Value>, keys: &[&str]) -> Option<Str
     None
 }
 
-fn tool_kind_and_title(name: &str, tool_input: &Map<String, Value>) -> (String, String) {
+#[derive(Clone, Copy)]
+enum ToolKind {
+    Command,
+    FileChange,
+    WebSearch,
+    Subagent,
+    Tool,
+}
+
+impl ToolKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ToolKind::Command => "command",
+            ToolKind::FileChange => "file_change",
+            ToolKind::WebSearch => "web_search",
+            ToolKind::Subagent => "subagent",
+            ToolKind::Tool => "tool",
+        }
+    }
+}
+
+const TOOL_KIND_MAP: &[(&str, ToolKind)] = &[
+    ("bash", ToolKind::Command),
+    ("shell", ToolKind::Command),
+    ("read", ToolKind::FileChange),
+    ("edit", ToolKind::FileChange),
+    ("write", ToolKind::FileChange),
+    ("multiedit", ToolKind::FileChange),
+    ("websearch", ToolKind::WebSearch),
+    ("web_search", ToolKind::WebSearch),
+    ("webfetch", ToolKind::WebSearch),
+    ("browser", ToolKind::WebSearch),
+    ("task", ToolKind::Subagent),
+    ("agent", ToolKind::Subagent),
+];
+
+fn tool_kind(name: &str) -> ToolKind {
     let name_lower = name.to_lowercase();
-    if ["bash", "shell"].contains(&name_lower.as_str()) {
-        let command = tool_input.get("command").and_then(Value::as_str).unwrap_or(name);
-        return ("command".to_string(), command.to_string());
+    for (tool_name, kind) in TOOL_KIND_MAP {
+        if *tool_name == name_lower {
+            return *kind;
+        }
     }
-    if ["read", "edit", "write", "multiedit"].contains(&name_lower.as_str()) {
-        let path = tool_input_path(tool_input, &["file_path", "path"]).unwrap_or_else(|| name.to_string());
-        return ("file_change".to_string(), path);
-    }
-    if ["websearch", "web_search", "webfetch", "browser"].contains(&name_lower.as_str()) {
-        let query = tool_input
+    ToolKind::Tool
+}
+
+fn tool_kind_and_title(name: &str, tool_input: &Map<String, Value>) -> (String, String) {
+    let kind = tool_kind(name);
+    let title = match kind {
+        ToolKind::Command => tool_input.get("command").and_then(Value::as_str).unwrap_or(name).to_string(),
+        ToolKind::FileChange => tool_input_path(tool_input, &["file_path", "path"]).unwrap_or_else(|| name.to_string()),
+        ToolKind::WebSearch => tool_input
             .get("query")
             .or_else(|| tool_input.get("url"))
             .and_then(Value::as_str)
-            .unwrap_or(name);
-        return ("web_search".to_string(), query.to_string());
-    }
-    if ["task", "agent"].contains(&name_lower.as_str()) {
-        let title = tool_input
+            .unwrap_or(name)
+            .to_string(),
+        ToolKind::Subagent => tool_input
             .get("title")
             .or_else(|| tool_input.get("name"))
             .and_then(Value::as_str)
-            .unwrap_or(name);
-        return ("subagent".to_string(), title.to_string());
-    }
-    ("tool".to_string(), name.to_string())
+            .unwrap_or(name)
+            .to_string(),
+        ToolKind::Tool => name.to_string(),
+    };
+    (kind.as_str().to_string(), title)
 }
 
 fn claude_result_preview(content: Option<&Value>) -> String {
