@@ -48,6 +48,8 @@ enum RepoCommands {
     Add {
         path: Option<PathBuf>,
         #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
         name: Option<String>,
         #[arg(long = "default-branch")]
         default_branch: Option<String>,
@@ -71,6 +73,20 @@ enum WorkspaceCommands {
     },
     Archive {
         workspace: String,
+    },
+    Files {
+        workspace: String,
+    },
+    Changes {
+        workspace: String,
+    },
+    File {
+        workspace: String,
+        path: String,
+    },
+    Diff {
+        workspace: String,
+        path: String,
     },
 }
 
@@ -104,16 +120,30 @@ fn main() -> Result<()> {
             match command {
                 RepoCommands::Add {
                     path,
+                    url,
                     name,
                     default_branch,
                 } => {
-                    let path = path.unwrap_or_else(|| PathBuf::from("."));
-                    let repo = core::repo_add(
-                        &conn,
-                        &path,
-                        name.as_deref(),
-                        default_branch.as_deref(),
-                    )?;
+                    let repo = if let Some(url) = url {
+                        if path.is_some() {
+                            return Err(anyhow!("repo add: use either a path or --url"));
+                        }
+                        core::repo_add_url(
+                            &conn,
+                            &home,
+                            &url,
+                            name.as_deref(),
+                            default_branch.as_deref(),
+                        )?
+                    } else {
+                        let path = path.unwrap_or_else(|| PathBuf::from("."));
+                        core::repo_add(
+                            &conn,
+                            &path,
+                            name.as_deref(),
+                            default_branch.as_deref(),
+                        )?
+                    };
                     if cli.json {
                         print_json(&repo)?;
                     } else {
@@ -179,6 +209,42 @@ fn main() -> Result<()> {
                         print_json(&result)?;
                     } else {
                         println!("{}", result.id);
+                    }
+                }
+                WorkspaceCommands::Files { workspace } => {
+                    let files = core::workspace_files(&conn, &workspace)?;
+                    if cli.json {
+                        print_json(&files)?;
+                    } else {
+                        for path in files {
+                            println!("{path}");
+                        }
+                    }
+                }
+                WorkspaceCommands::Changes { workspace } => {
+                    let changes = core::workspace_changes(&conn, &workspace)?;
+                    if cli.json {
+                        print_json(&changes)?;
+                    } else {
+                        for change in changes {
+                            println!("{}\t{}", change.status, change.path);
+                        }
+                    }
+                }
+                WorkspaceCommands::File { workspace, path } => {
+                    let content = core::workspace_file_content(&conn, &workspace, &path)?;
+                    if cli.json {
+                        print_json(&json!({ "content": content }))?;
+                    } else {
+                        println!("{content}");
+                    }
+                }
+                WorkspaceCommands::Diff { workspace, path } => {
+                    let diff = core::workspace_file_diff(&conn, &workspace, &path)?;
+                    if cli.json {
+                        print_json(&json!({ "patch": diff }))?;
+                    } else {
+                        println!("{diff}");
                     }
                 }
             }

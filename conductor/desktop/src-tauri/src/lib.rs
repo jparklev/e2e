@@ -1,5 +1,5 @@
 use conductor_agent::AgentParser;
-use conductor_core::{self as core, ArchiveResult, Repo, Workspace};
+use conductor_core::{self as core, ArchiveResult, Repo, Workspace, WorkspaceChange};
 use serde_json::Value;
 use std::path::PathBuf;
 
@@ -45,6 +45,28 @@ fn add_repo(
 }
 
 #[tauri::command]
+fn add_repo_url(
+    home: Option<String>,
+    url: String,
+    name: Option<String>,
+    default_branch: Option<String>,
+) -> Result<Repo, String> {
+    if url.starts_with('-') {
+        return Err("repo url must not start with '-'".to_string());
+    }
+    let home = resolve_home(home)?;
+    let conn = core::connect(&home).map_err(map_err)?;
+    core::repo_add_url(
+        &conn,
+        &home,
+        &url,
+        name.as_deref(),
+        default_branch.as_deref(),
+    )
+    .map_err(map_err)
+}
+
+#[tauri::command]
 fn list_workspaces(home: Option<String>, repo: Option<String>) -> Result<Vec<Workspace>, String> {
     let home = resolve_home(home)?;
     let conn = core::connect(&home).map_err(map_err)?;
@@ -86,6 +108,34 @@ fn archive_workspace(home: Option<String>, workspace: String) -> Result<ArchiveR
 }
 
 #[tauri::command]
+fn workspace_files(home: Option<String>, workspace: String) -> Result<Vec<String>, String> {
+    let home = resolve_home(home)?;
+    let conn = core::connect(&home).map_err(map_err)?;
+    core::workspace_files(&conn, &workspace).map_err(map_err)
+}
+
+#[tauri::command]
+fn workspace_changes(home: Option<String>, workspace: String) -> Result<Vec<WorkspaceChange>, String> {
+    let home = resolve_home(home)?;
+    let conn = core::connect(&home).map_err(map_err)?;
+    core::workspace_changes(&conn, &workspace).map_err(map_err)
+}
+
+#[tauri::command]
+fn workspace_file_content(home: Option<String>, workspace: String, path: String) -> Result<String, String> {
+    let home = resolve_home(home)?;
+    let conn = core::connect(&home).map_err(map_err)?;
+    core::workspace_file_content(&conn, &workspace, &path).map_err(map_err)
+}
+
+#[tauri::command]
+fn workspace_file_diff(home: Option<String>, workspace: String, path: String) -> Result<String, String> {
+    let home = resolve_home(home)?;
+    let conn = core::connect(&home).map_err(map_err)?;
+    core::workspace_file_diff(&conn, &workspace, &path).map_err(map_err)
+}
+
+#[tauri::command]
 fn parse_agent_lines(lines: Vec<String>) -> Result<Vec<Value>, String> {
     let mut parser = AgentParser::new();
     let mut out = Vec::new();
@@ -108,9 +158,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_repos,
             add_repo,
+            add_repo_url,
             list_workspaces,
             create_workspace,
             archive_workspace,
+            workspace_files,
+            workspace_changes,
+            workspace_file_content,
+            workspace_file_diff,
             parse_agent_lines
         ])
         .run(tauri::generate_context!())

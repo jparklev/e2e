@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use uuid::Uuid;
 
@@ -127,6 +127,12 @@ pub struct Workspace {
 pub struct ArchiveResult {
     pub id: String,
     pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceChange {
+    pub path: String,
+    pub status: String,
 }
 
 pub fn default_home() -> PathBuf {
@@ -282,6 +288,19 @@ fn resolve_base_ref(repo_root: &Path, base_branch: &str) -> Result<String> {
     bail!("base branch not found: {base_branch}");
 }
 
+fn repo_name_from_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    let tail = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let tail = tail.rsplit(':').next().unwrap_or(tail);
+    let tail = tail.strip_suffix(".git").unwrap_or(tail);
+    let tail = tail.trim();
+    if tail.is_empty() {
+        "repo".to_string()
+    } else {
+        tail.to_string()
+    }
+}
+
 pub fn safe_dir_name(name: &str) -> String {
     let mut out = String::new();
     for ch in name.trim().chars() {
@@ -297,6 +316,23 @@ pub fn safe_dir_name(name: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+fn safe_workspace_relpath(path: &str) -> Result<PathBuf> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        bail!("file path is required");
+    }
+    let rel = PathBuf::from(trimmed);
+    for component in rel.components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("file path must be relative");
+            }
+            _ => {}
+        }
+    }
+    Ok(rel)
 }
 
 fn auto_workspace_name(conn: &Connection, repo_id: &str) -> Result<String> {
@@ -399,6 +435,31 @@ fn get_workspace(conn: &Connection, ws_ref: &str) -> Result<(String, String, Str
     bail!("workspace not found: {ws_ref}");
 }
 
+struct WorkspaceContext {
+    repo_root: PathBuf,
+    base_branch: String,
+    path: PathBuf,
+}
+
+fn workspace_context(conn: &Connection, ws_ref: &str) -> Result<WorkspaceContext> {
+    let (ws_id, repo_id, path, _branch) = get_workspace(conn, ws_ref)?;
+    let base_branch: String = conn.query_row(
+        "SELECT base_branch FROM workspaces WHERE id = ?",
+        [ws_id],
+        |row| row.get(0),
+    )?;
+    let repo_root: String = conn.query_row(
+        "SELECT root_path FROM repos WHERE id = ?",
+        [repo_id],
+        |row| row.get(0),
+    )?;
+    Ok(WorkspaceContext {
+        repo_root: PathBuf::from(repo_root),
+        base_branch,
+        path: PathBuf::from(path),
+    })
+}
+
 pub fn workspace_path(conn: &Connection, ws_ref: &str) -> Result<PathBuf> {
     let (_id, _repo_id, path, _branch) = get_workspace(conn, ws_ref)?;
     Ok(PathBuf::from(path))
@@ -457,6 +518,39 @@ pub fn repo_add(conn: &Connection, path: &Path, name: Option<&str>, default_bran
         default_branch,
         remote_url,
     })
+}
+
+pub fn repo_add_url(
+    conn: &Connection,
+    home: &Path,
+    url: &str,
+    name: Option<&str>,
+    default_branch: Option<&str>,
+) -> Result<Repo> {
+    if url.starts_with('-') {
+        bail!("repo url must not start with '-'");
+    }
+    ensure_home_dirs(home)?;
+    let display_name = match name {
+        Some(name) if !name.trim().is_empty() => name.trim().to_string(),
+        _ => repo_name_from_url(url),
+    };
+    let dir_name = safe_dir_name(&display_name);
+    let repo_dir = home.join("repos").join(&dir_name);
+    if repo_dir.exists() {
+        if repo_dir.join(".git").exists() {
+            return repo_add(conn, &repo_dir, Some(&display_name), default_branch);
+        }
+        bail!("repo path already exists: {}", repo_dir.display());
+    }
+    let cmd = vec![
+        "git".to_string(),
+        "clone".to_string(),
+        url.to_string(),
+        repo_dir.to_string_lossy().to_string(),
+    ];
+    run(&cmd, Some(home))?;
+    repo_add(conn, &repo_dir, Some(&display_name), default_branch)
 }
 
 pub fn repo_list(conn: &Connection) -> Result<Vec<Repo>> {
@@ -602,6 +696,73 @@ pub fn workspace_list(conn: &Connection, repo_filter: Option<&str>) -> Result<Ve
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+pub fn workspace_files(conn: &Connection, ws_ref: &str) -> Result<Vec<String>> {
+    let context = workspace_context(conn, ws_ref)?;
+    let tracked = git(&context.path, &["ls-files"])?;
+    let mut files: Vec<String> = tracked
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+pub fn workspace_changes(conn: &Connection, ws_ref: &str) -> Result<Vec<WorkspaceChange>> {
+    let context = workspace_context(conn, ws_ref)?;
+    let base_ref = resolve_base_ref(&context.repo_root, &context.base_branch)?;
+    let diff = git(
+        &context.path,
+        &[
+            "diff",
+            "--name-status",
+            "--no-color",
+            &format!("{base_ref}...HEAD"),
+        ],
+    )?;
+    let mut changes = Vec::new();
+    for line in diff.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let status = parts[0].to_string();
+        let path = parts.last().unwrap().to_string();
+        changes.push(WorkspaceChange { path, status });
+    }
+    Ok(changes)
+}
+
+pub fn workspace_file_content(conn: &Connection, ws_ref: &str, file_path: &str) -> Result<String> {
+    let context = workspace_context(conn, ws_ref)?;
+    let rel = safe_workspace_relpath(file_path)?;
+    let full_path = context.path.join(rel);
+    let bytes = std::fs::read(&full_path)?;
+    String::from_utf8(bytes).map_err(|_| anyhow!("file is not valid utf-8"))
+}
+
+pub fn workspace_file_diff(conn: &Connection, ws_ref: &str, file_path: &str) -> Result<String> {
+    let context = workspace_context(conn, ws_ref)?;
+    let rel = safe_workspace_relpath(file_path)?;
+    let base_ref = resolve_base_ref(&context.repo_root, &context.base_branch)?;
+    let rel_str = rel.to_string_lossy().to_string();
+    git(
+        &context.path,
+        &[
+            "diff",
+            "--no-color",
+            &format!("{base_ref}...HEAD"),
+            "--",
+            &rel_str,
+        ],
+    )
 }
 
 pub fn workspace_archive(conn: &Connection, workspace_ref: &str) -> Result<ArchiveResult> {
