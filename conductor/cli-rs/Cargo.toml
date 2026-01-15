@@ -1,0 +1,17 @@
+[package]
+name = "conductor-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "conductor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+conductor-agent = { path = "../agent" }
+conductor-core = { path = "../core" }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
