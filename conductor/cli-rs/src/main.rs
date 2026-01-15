@@ -73,6 +73,8 @@ enum WorkspaceCommands {
     },
     Archive {
         workspace: String,
+        #[arg(long)]
+        force: bool,
     },
     Files {
         workspace: String,
@@ -203,8 +205,8 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                WorkspaceCommands::Archive { workspace } => {
-                    let result = core::workspace_archive(&conn, &workspace)?;
+                WorkspaceCommands::Archive { workspace, force } => {
+                    let result = core::workspace_archive(&conn, &workspace, force)?;
                     if cli.json {
                         print_json(&result)?;
                     } else {

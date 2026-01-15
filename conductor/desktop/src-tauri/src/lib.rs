@@ -1,14 +1,29 @@
 use conductor_agent::AgentParser;
 use conductor_core::{self as core, ArchiveResult, Repo, Workspace, WorkspaceChange};
 use serde_json::Value;
+use std::env;
 use std::path::PathBuf;
+
+fn expand_tilde(path: &str) -> PathBuf {
+    let trimmed = path.trim();
+    if trimmed == "~" || trimmed.starts_with("~/") {
+        if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
+            let mut expanded = PathBuf::from(home);
+            if trimmed.len() > 2 {
+                expanded.push(&trimmed[2..]);
+            }
+            return expanded;
+        }
+    }
+    PathBuf::from(trimmed)
+}
 
 fn resolve_home(home: Option<String>) -> Result<PathBuf, String> {
     if let Some(home) = home {
         if home.is_empty() {
             return Ok(core::default_home());
         }
-        let path = PathBuf::from(home);
+        let path = expand_tilde(&home);
         if path.exists() && !path.is_dir() {
             return Err("home must be a directory".to_string());
         }
@@ -98,13 +113,13 @@ fn create_workspace(
 }
 
 #[tauri::command]
-fn archive_workspace(home: Option<String>, workspace: String) -> Result<ArchiveResult, String> {
+fn archive_workspace(home: Option<String>, workspace: String, force: Option<bool>) -> Result<ArchiveResult, String> {
     if workspace.starts_with('-') {
         return Err("workspace must not start with '-'".to_string());
     }
     let home = resolve_home(home)?;
     let conn = core::connect(&home).map_err(map_err)?;
-    core::workspace_archive(&conn, &workspace).map_err(map_err)
+    core::workspace_archive(&conn, &workspace, force.unwrap_or(false)).map_err(map_err)
 }
 
 #[tauri::command]

@@ -355,6 +355,8 @@ function App() {
   const demoNextId = useRef(demoWorkspaces.length + 1);
   const demoNextRepoId = useRef(demoRepos.length + 1);
   const chatStore = useRef(new Map<string, ChatMessage[]>());
+  const filesReq = useRef(0);
+  const previewReq = useRef(0);
 
   const workspaceById = useMemo(() => {
     const map = new Map<string, Workspace>();
@@ -663,6 +665,7 @@ function App() {
   }, [workspaces, openWorkspaceIds, activeWorkspaceId]);
 
   useEffect(() => {
+    const req = ++filesReq.current;
     if (!activeWorkspace) {
       setFiles([]);
       setChanges([]);
@@ -670,6 +673,7 @@ function App() {
       setFileContent(null);
       setFileDiff(null);
       setFileError(null);
+      setFilesLoading(false);
       return;
     }
     setFilesLoading(true);
@@ -677,6 +681,9 @@ function App() {
     if (isDemo) {
       const nextFiles = demoFilesByWorkspace[activeWorkspace.id] ?? demoFiles;
       const nextChanges = demoChangesByWorkspace[activeWorkspace.id] ?? [];
+      if (filesReq.current !== req) {
+        return;
+      }
       setFiles(nextFiles);
       setChanges(nextChanges);
       setSelectedFile(nextChanges[0]?.path ?? nextFiles[0] ?? null);
@@ -690,25 +697,35 @@ function App() {
           safeInvoke<string[]>("workspace_files", { ...args, workspace: activeWorkspace.id }),
           safeInvoke<WorkspaceChange[]>("workspace_changes", { ...args, workspace: activeWorkspace.id }),
         ]);
+        if (filesReq.current !== req) {
+          return;
+        }
         setFiles(nextFiles);
         setChanges(nextChanges);
         setSelectedFile(nextChanges[0]?.path ?? nextFiles[0] ?? null);
       } catch (e) {
+        if (filesReq.current !== req) {
+          return;
+        }
         const message = e instanceof Error ? e.message : String(e);
         setFileError(message);
         setFiles([]);
         setChanges([]);
         setSelectedFile(null);
       } finally {
-        setFilesLoading(false);
+        if (filesReq.current === req) {
+          setFilesLoading(false);
+        }
       }
     })();
   }, [activeWorkspace, isDemo, home]);
 
   useEffect(() => {
+    const req = ++previewReq.current;
     if (!activeWorkspace || !selectedFile) {
       setFileContent(null);
       setFileDiff(null);
+      setFileViewLoading(false);
       return;
     }
     setFileViewLoading(true);
@@ -716,6 +733,9 @@ function App() {
     const change = changesByPath.get(selectedFile);
     if (isDemo) {
       const diff = demoDiffs[selectedFile];
+      if (previewReq.current !== req) {
+        return;
+      }
       if (diff && diff.trim()) {
         setFileDiff(diff);
         setFileContent(null);
@@ -735,6 +755,9 @@ function App() {
             workspace: activeWorkspace.id,
             path: selectedFile,
           });
+          if (previewReq.current !== req) {
+            return;
+          }
           if (patch.trim()) {
             setFileDiff(patch);
             setFileContent(null);
@@ -744,6 +767,9 @@ function App() {
               workspace: activeWorkspace.id,
               path: selectedFile,
             });
+            if (previewReq.current !== req) {
+              return;
+            }
             setFileDiff(null);
             setFileContent(content);
           }
@@ -753,16 +779,24 @@ function App() {
             workspace: activeWorkspace.id,
             path: selectedFile,
           });
+          if (previewReq.current !== req) {
+            return;
+          }
           setFileDiff(null);
           setFileContent(content);
         }
       } catch (e) {
+        if (previewReq.current !== req) {
+          return;
+        }
         const message = e instanceof Error ? e.message : String(e);
         setFileError(message);
         setFileContent(null);
         setFileDiff(null);
       } finally {
-        setFileViewLoading(false);
+        if (previewReq.current === req) {
+          setFileViewLoading(false);
+        }
       }
     })();
   }, [activeWorkspace, changesByPath, isDemo, home, selectedFile]);

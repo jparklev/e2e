@@ -591,6 +591,7 @@ pub fn workspace_create(
     let repo = get_repo(conn, repo_ref)?;
     let repo_root = PathBuf::from(&repo.root_path);
     let base_branch = base.unwrap_or(&repo.default_branch);
+    let base_ref = resolve_base_ref(&repo_root, base_branch)?;
 
     let name = if let Some(name) = name {
         name.to_string()
@@ -618,7 +619,6 @@ pub fn workspace_create(
         ];
         run(&cmd, Some(&repo_root))?;
     } else {
-        let base_ref = resolve_base_ref(&repo_root, base_branch)?;
         let cmd = vec![
             "git".to_string(),
             "worktree".to_string(),
@@ -626,7 +626,7 @@ pub fn workspace_create(
             "-b".to_string(),
             branch.clone(),
             workspace_path.to_string_lossy().to_string(),
-            base_ref,
+            base_ref.clone(),
         ];
         run(&cmd, Some(&repo_root))?;
     }
@@ -637,7 +637,7 @@ pub fn workspace_create(
         INSERT INTO workspaces (id, repository_id, directory_name, path, branch, base_branch, state)
         VALUES (?, ?, ?, ?, ?, ?, 'ready')
         ",
-        params![ws_id, repo.id, name, workspace_path.to_string_lossy().to_string(), branch, base_branch],
+        params![ws_id, repo.id, name, workspace_path.to_string_lossy().to_string(), branch, base_ref.clone()],
     );
 
     if let Err(err) = insert {
@@ -660,7 +660,7 @@ pub fn workspace_create(
         repo: repo.name,
         name,
         branch,
-        base_branch: base_branch.to_string(),
+        base_branch: base_ref,
         state: "ready".to_string(),
         path: workspace_path.to_string_lossy().to_string(),
     })
@@ -776,7 +776,7 @@ pub fn workspace_file_diff(conn: &Connection, ws_ref: &str, file_path: &str) -> 
     )
 }
 
-pub fn workspace_archive(conn: &Connection, workspace_ref: &str) -> Result<ArchiveResult> {
+pub fn workspace_archive(conn: &Connection, workspace_ref: &str, force: bool) -> Result<ArchiveResult> {
     let (ws_id, repo_id, path, _branch) = get_workspace(conn, workspace_ref)?;
     let repo: Repo = conn.query_row(
         "SELECT id, name, root_path, default_branch, remote_url FROM repos WHERE id = ?",
@@ -794,28 +794,38 @@ pub fn workspace_archive(conn: &Connection, workspace_ref: &str) -> Result<Archi
 
     let repo_root = PathBuf::from(repo.root_path);
     let ws_path = PathBuf::from(path);
+    let mut removed = false;
     if ws_path.exists() {
-        let status = git(&ws_path, &["status", "--porcelain", "--untracked-files=all"])?;
-        if !status.trim().is_empty() {
-            bail!(
-                "workspace has uncommitted changes; commit or stash before archiving: {}",
-                ws_path.display()
-            );
+        if !force {
+            let status = git(&ws_path, &["status", "--porcelain", "--untracked-files=all"])?;
+            if !status.trim().is_empty() {
+                bail!(
+                    "workspace has uncommitted changes; commit or stash before archiving, or pass --force: {}",
+                    ws_path.display()
+                );
+            }
         }
-        run(
-            &[
-                "git".to_string(),
-                "worktree".to_string(),
-                "remove".to_string(),
-                ws_path.to_string_lossy().to_string(),
-            ],
-            Some(&repo_root),
-        )?;
+        let mut cmd = vec![
+            "git".to_string(),
+            "worktree".to_string(),
+            "remove".to_string(),
+        ];
+        if force {
+            cmd.push("--force".to_string());
+        }
+        cmd.push(ws_path.to_string_lossy().to_string());
+        run(&cmd, Some(&repo_root))?;
+        removed = true;
     }
-    let _ = run(
+    let prune = run(
         &["git".to_string(), "worktree".to_string(), "prune".to_string()],
         Some(&repo_root),
     );
+    if let Err(err) = prune {
+        if removed {
+            return Err(err);
+        }
+    }
 
     conn.execute(
         "UPDATE workspaces SET state = 'archived', updated_at = datetime('now') WHERE id = ?",

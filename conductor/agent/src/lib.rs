@@ -156,7 +156,7 @@ fn parse_codex_event(value: &Value, state: &mut CodexState) -> Option<Vec<Value>
                     Some("warning"),
                 )]);
             }
-            Some(vec![])
+            None
         }
         "item.started" | "item.updated" | "item.completed" => {
             let phase = match event_type {
