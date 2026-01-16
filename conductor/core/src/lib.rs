@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
 use std::fmt;
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 use uuid::Uuid;
+use chrono::Utc;
 
 pub const SCHEMA_VERSION: i64 = 3;
 
@@ -757,6 +759,9 @@ pub fn workspace_create(
         return Err(err.into());
     }
 
+    // Initialize .conductor-app/ folder
+    let _ = ensure_conductor_app(&workspace_path);
+
     Ok(Workspace {
         id: ws_id,
         repo_id: repo.id,
@@ -812,12 +817,22 @@ pub fn workspace_list(conn: &Connection, repo_filter: Option<&str>) -> Result<Ve
 
 pub fn workspace_files(conn: &Connection, ws_ref: &str) -> Result<Vec<String>> {
     let context = workspace_context(conn, ws_ref)?;
+    // Get tracked files
     let tracked = git(&context.path, &["ls-files", "-z"])?;
     let mut files: Vec<String> = tracked
         .split('\0')
         .filter(|entry| !entry.is_empty())
         .map(|entry| entry.to_string())
         .collect();
+    // Also get untracked files (excluding .gitignore patterns)
+    if let Ok(untracked) = git(&context.path, &["ls-files", "--others", "--exclude-standard", "-z"]) {
+        files.extend(
+            untracked
+                .split('\0')
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| entry.to_string())
+        );
+    }
     files.sort();
     files.dedup();
     Ok(files)
@@ -837,6 +852,7 @@ pub fn workspace_changes(conn: &Connection, ws_ref: &str) -> Result<Vec<Workspac
         ],
     )?;
     let mut changes = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
     let mut parts = diff.split('\0').filter(|part| !part.is_empty());
     while let Some(status) = parts.next() {
         if status.starts_with('R') || status.starts_with('C') {
@@ -848,6 +864,7 @@ pub fn workspace_changes(conn: &Connection, ws_ref: &str) -> Result<Vec<Workspac
                 Some(path) => path,
                 None => break,
             };
+            seen_paths.insert(new_path.to_string());
             changes.push(WorkspaceChange {
                 old_path: Some(old_path.to_string()),
                 path: new_path.to_string(),
@@ -858,11 +875,40 @@ pub fn workspace_changes(conn: &Connection, ws_ref: &str) -> Result<Vec<Workspac
                 Some(path) => path,
                 None => break,
             };
+            seen_paths.insert(path.to_string());
             changes.push(WorkspaceChange {
                 old_path: None,
                 path: path.to_string(),
                 status: status.to_string(),
             });
+        }
+    }
+    // Also include untracked files as new additions
+    if let Ok(untracked) = git(&context.path, &["ls-files", "--others", "--exclude-standard", "-z"]) {
+        for path in untracked.split('\0').filter(|p| !p.is_empty()) {
+            if !seen_paths.contains(path) {
+                changes.push(WorkspaceChange {
+                    old_path: None,
+                    path: path.to_string(),
+                    status: "?".to_string(), // Untracked
+                });
+            }
+        }
+    }
+    // Also include modified but unstaged files
+    if let Ok(modified) = git(&context.path, &["diff", "--name-status", "-z"]) {
+        let mut mod_parts = modified.split('\0').filter(|p| !p.is_empty());
+        while let Some(status) = mod_parts.next() {
+            if let Some(path) = mod_parts.next() {
+                if !seen_paths.contains(path) {
+                    seen_paths.insert(path.to_string());
+                    changes.push(WorkspaceChange {
+                        old_path: None,
+                        path: path.to_string(),
+                        status: status.to_string(),
+                    });
+                }
+            }
         }
     }
     Ok(changes)
@@ -893,7 +939,171 @@ pub fn workspace_file_diff(conn: &Connection, ws_ref: &str, file_path: &str) -> 
     )
 }
 
-pub fn workspace_archive(conn: &Connection, workspace_ref: &str, force: bool) -> Result<ArchiveResult> {
+// =============================================================================
+// .conductor-app/ Folder Structure
+// =============================================================================
+
+/// Session state stored in .conductor-app/session.json
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionState {
+    pub agent_id: String,
+    pub resume_id: Option<String>,
+    pub started_at: String,
+    pub updated_at: String,
+}
+
+/// Chat message for persistence in .conductor-app/chat.md
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatEntry {
+    pub role: String,
+    pub content: String,
+    pub timestamp: String,
+}
+
+/// Get the path to .conductor-app/ folder within a workspace
+pub fn conductor_app_path(ws_path: &Path) -> PathBuf {
+    ws_path.join(".conductor-app")
+}
+
+/// Ensure .conductor-app/ folder exists with initial structure
+pub fn ensure_conductor_app(ws_path: &Path) -> Result<PathBuf> {
+    let app_dir = conductor_app_path(ws_path);
+    fs(std::fs::create_dir_all(&app_dir))?;
+    Ok(app_dir)
+}
+
+/// Read session state from .conductor-app/session.json
+pub fn session_read(ws_path: &Path) -> Result<Option<SessionState>> {
+    let session_path = conductor_app_path(ws_path).join("session.json");
+    if !session_path.exists() {
+        return Ok(None);
+    }
+    let content = fs(std::fs::read_to_string(&session_path))?;
+    let session: SessionState = serde_json::from_str(&content)
+        .map_err(|e| anyhow!("failed to parse session.json: {}", e))?;
+    Ok(Some(session))
+}
+
+/// Write session state to .conductor-app/session.json
+pub fn session_write(ws_path: &Path, session: &SessionState) -> Result<()> {
+    let app_dir = ensure_conductor_app(ws_path)?;
+    let session_path = app_dir.join("session.json");
+    let content = serde_json::to_string_pretty(session)
+        .map_err(|e| anyhow!("failed to serialize session: {}", e))?;
+    let mut file = fs(std::fs::File::create(&session_path))?;
+    fs(file.write_all(content.as_bytes()))?;
+    Ok(())
+}
+
+/// Create a new session with the given agent ID
+pub fn session_create(ws_path: &Path, agent_id: &str) -> Result<SessionState> {
+    let now = Utc::now().to_rfc3339();
+    let session = SessionState {
+        agent_id: agent_id.to_string(),
+        resume_id: None,
+        started_at: now.clone(),
+        updated_at: now,
+    };
+    session_write(ws_path, &session)?;
+    Ok(session)
+}
+
+/// Update session with a resume ID (for CLI --resume flag)
+pub fn session_set_resume_id(ws_path: &Path, resume_id: &str) -> Result<SessionState> {
+    let mut session = session_read(ws_path)?
+        .ok_or_else(|| anyhow!("no session found"))?;
+    session.resume_id = Some(resume_id.to_string());
+    session.updated_at = Utc::now().to_rfc3339();
+    session_write(ws_path, &session)?;
+    Ok(session)
+}
+
+/// Read chat history from .conductor-app/chat.md
+pub fn chat_read(ws_path: &Path) -> Result<String> {
+    let chat_path = conductor_app_path(ws_path).join("chat.md");
+    if !chat_path.exists() {
+        return Ok(String::new());
+    }
+    fs(std::fs::read_to_string(&chat_path))
+}
+
+/// Append a message to .conductor-app/chat.md
+pub fn chat_append(ws_path: &Path, role: &str, content: &str) -> Result<()> {
+    let app_dir = ensure_conductor_app(ws_path)?;
+    let chat_path = app_dir.join("chat.md");
+    let timestamp = Utc::now().to_rfc3339();
+
+    let mut file = fs(std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&chat_path))?;
+
+    // Format: ## Role (timestamp)\n\ncontent\n\n---\n\n
+    let entry = format!("## {} ({})\n\n{}\n\n---\n\n", role, timestamp, content);
+    fs(file.write_all(entry.as_bytes()))?;
+    Ok(())
+}
+
+/// Clear chat history
+pub fn chat_clear(ws_path: &Path) -> Result<()> {
+    let chat_path = conductor_app_path(ws_path).join("chat.md");
+    if chat_path.exists() {
+        fs(std::fs::remove_file(&chat_path))?;
+    }
+    Ok(())
+}
+
+/// Archive session data before workspace archive (to global archive location)
+pub fn conductor_app_archive(home: &Path, ws_id: &str, ws_path: &Path) -> Result<()> {
+    let app_dir = conductor_app_path(ws_path);
+    if !app_dir.exists() {
+        return Ok(());
+    }
+
+    // Create archive in global location (survives worktree removal)
+    // Uses .conductor-app/archive/ at the home level for consistency
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let archive_dir = home.join(".conductor-app").join("archive").join(ws_id).join(&timestamp);
+    fs(std::fs::create_dir_all(&archive_dir))?;
+
+    // Copy (not move) session.json and chat.md to archive
+    let session_path = app_dir.join("session.json");
+    if session_path.exists() {
+        fs(std::fs::copy(&session_path, archive_dir.join("session.json")))?;
+    }
+    let chat_path = app_dir.join("chat.md");
+    if chat_path.exists() {
+        fs(std::fs::copy(&chat_path, archive_dir.join("chat.md")))?;
+    }
+
+    Ok(())
+}
+
+/// Update session with a resume ID, creating session if it doesn't exist
+pub fn session_upsert_resume_id(ws_path: &Path, agent_id: &str, resume_id: &str) -> Result<SessionState> {
+    let now = Utc::now().to_rfc3339();
+    let session = match session_read(ws_path)? {
+        Some(mut s) => {
+            s.resume_id = Some(resume_id.to_string());
+            s.updated_at = now;
+            s
+        }
+        None => SessionState {
+            agent_id: agent_id.to_string(),
+            resume_id: Some(resume_id.to_string()),
+            started_at: now.clone(),
+            updated_at: now,
+        }
+    };
+    session_write(ws_path, &session)?;
+    Ok(session)
+}
+
+// =============================================================================
+// Workspace Archive
+// =============================================================================
+
+pub fn workspace_archive(conn: &Connection, home: &Path, workspace_ref: &str, force: bool) -> Result<ArchiveResult> {
     let ws = get_workspace(conn, workspace_ref)?;
     let ws_id = ws.id.clone();
     let repo_root = PathBuf::from(ws.repo_root);
@@ -901,6 +1111,11 @@ pub fn workspace_archive(conn: &Connection, workspace_ref: &str, force: bool) ->
     let mut removed = false;
     let mut message = "archived".to_string();
     if ws_path.exists() {
+        // Archive .conductor-app/ data before removing worktree (to global archive)
+        if let Err(err) = conductor_app_archive(home, &ws_id, &ws_path) {
+            message = format!("warning: failed to archive session data: {err}");
+        }
+
         if !force {
             let status = git(&ws_path, &["status", "--porcelain", "--untracked-files=all"])?;
             if !status.trim().is_empty() {

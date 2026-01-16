@@ -404,6 +404,68 @@ fn codex_todo_summary(items: Option<&Value>) -> (usize, usize, Option<String>) {
     (done, total, next_text)
 }
 
+/// Parse Claude's TodoWrite tool input into a summary title and detail map
+fn parse_claude_todos(tool_input: &Map<String, Value>) -> (String, Map<String, Value>) {
+    let mut detail = Map::new();
+    let todos = tool_input.get("todos").and_then(Value::as_array);
+
+    let Some(todos) = todos else {
+        return ("todo".to_string(), detail);
+    };
+
+    // Count by status: pending, in_progress, completed
+    let mut pending = 0usize;
+    let mut in_progress = 0usize;
+    let mut completed = 0usize;
+    let mut current_task: Option<String> = None;
+
+    for todo in todos {
+        let obj = match todo.as_object() {
+            Some(obj) => obj,
+            None => continue,
+        };
+        let status = obj.get("status").and_then(Value::as_str).unwrap_or("pending");
+        match status {
+            "completed" => completed += 1,
+            "in_progress" => {
+                in_progress += 1;
+                // Use activeForm for display (the -ing form)
+                if current_task.is_none() {
+                    current_task = obj
+                        .get("activeForm")
+                        .or_else(|| obj.get("content"))
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string());
+                }
+            }
+            _ => pending += 1,
+        }
+    }
+
+    let total = pending + in_progress + completed;
+
+    // Build title: "todo 2/5: Running tests" or "todo 5/5: done"
+    let title = if let Some(task) = &current_task {
+        format!("todo {completed}/{total}: {task}")
+    } else if completed == total && total > 0 {
+        format!("todo {completed}/{total}: done")
+    } else {
+        format!("todo {completed}/{total}")
+    };
+
+    // Store counts and todos array in detail
+    detail.insert("pending".to_string(), Value::Number(pending.into()));
+    detail.insert("in_progress".to_string(), Value::Number(in_progress.into()));
+    detail.insert("completed".to_string(), Value::Number(completed.into()));
+    detail.insert("total".to_string(), Value::Number(total.into()));
+    detail.insert("todos".to_string(), Value::Array(todos.clone()));
+    if let Some(task) = current_task {
+        detail.insert("current_task".to_string(), Value::String(task));
+    }
+
+    (title, detail)
+}
+
 fn parse_claude_event(value: &Value, state: &mut ClaudeState) -> Option<Vec<Value>> {
     let event_type = value.get("type")?.as_str()?;
     match event_type {
@@ -439,6 +501,16 @@ fn parse_claude_event(value: &Value, state: &mut ClaudeState) -> Option<Vec<Valu
                         let tool_id = tool_id.unwrap();
                         let name = value_str(block, "name").unwrap_or("tool");
                         let tool_input = block.get("input").and_then(Value::as_object).cloned().unwrap_or_default();
+
+                        // Special handling for TodoWrite tool
+                        if name.eq_ignore_ascii_case("todowrite") {
+                            let (title, detail) = parse_claude_todos(&tool_input);
+                            let action = action_map(tool_id, "todo", &title, detail);
+                            state.pending.insert(tool_id.to_string(), action.clone());
+                            events.push(action_event("claude", "started", action, None, None, None));
+                            continue;
+                        }
+
                         let (kind, title) = tool_kind_and_title(name, &tool_input);
                         let mut detail = Map::new();
                         detail.insert("name".to_string(), Value::String(name.to_string()));

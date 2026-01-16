@@ -206,7 +206,7 @@ fn main() -> Result<()> {
                     }
                 }
                 WorkspaceCommands::Archive { workspace, force } => {
-                    let result = core::workspace_archive(&conn, &workspace, force)?;
+                    let result = core::workspace_archive(&conn, &home, &workspace, force)?;
                     if cli.json {
                         print_json(&result)?;
                     } else {

@@ -1,7 +1,59 @@
 import { PatchDiff } from "@pierre/diffs/react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import { useQueryClient } from "@tanstack/react-query";
+import Fuse from "fuse.js";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { codeToHtml } from "shiki";
 import "./App.css";
+import { ActionMessage } from "./lib/tool-registry";
+import { CommandPalette } from "./components/CommandPalette";
+import {
+  useRepos,
+  useWorkspaces,
+  useWorkspaceFiles,
+  useWorkspaceChanges,
+  useFileDiff,
+  useFileContent,
+  useAddRepo,
+  useCreateWorkspace,
+  useSession,
+  useChat,
+  useUpsertResumeId,
+  useAppendChat,
+} from "./lib/hooks";
+import { parseChatMd } from "./lib/chat-parser";
+import { Terminal } from "./components/Terminal";
+import { queryKeys } from "./lib/query";
+
+// Play a gentle bell notification sound when agent completes
+function playNotificationSound() {
+  try {
+    const audioContext = new AudioContext();
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+
+    // Gentle bell-like sound: high frequency, quick decay
+    oscillator.frequency.setValueAtTime(830, audioContext.currentTime); // E5 note
+    oscillator.type = "sine";
+
+    // Soft volume with quick fade
+    gainNode.gain.setValueAtTime(0.15, audioContext.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+
+    oscillator.start(audioContext.currentTime);
+    oscillator.stop(audioContext.currentTime + 0.5);
+  } catch {
+    // Audio not available, silently ignore
+  }
+}
+
+// =============================================================================
+// Types
+// =============================================================================
 
 type Repo = {
   id: string;
@@ -30,277 +82,258 @@ type WorkspaceChange = {
 
 type ChatMessage = {
   id: string;
-  role: "user" | "assistant" | "system";
+  role: "user" | "assistant" | "system" | "action";
   content: string;
   meta?: string;
+  actionKind?: string;
+  actionPhase?: string;
+  actionId?: string;
+  actionDetail?: Record<string, unknown>;
+  ok?: boolean;
 };
 
-type DataProvider = {
-  listRepos: () => Promise<Repo[]>;
-  listWorkspaces: () => Promise<Workspace[]>;
-  addRepoUrl: (url: string) => Promise<Repo>;
-  createWorkspace: (repoId: string, name?: string) => Promise<Workspace>;
-  workspaceFiles: (workspaceId: string) => Promise<string[]>;
-  workspaceChanges: (workspaceId: string) => Promise<WorkspaceChange[]>;
-  workspaceFileDiff: (workspaceId: string, path: string) => Promise<string>;
-  workspaceFileContent: (workspaceId: string, path: string) => Promise<string>;
-  resolveHome: (path: string) => Promise<string>;
+type ActionState = {
+  id: string;
+  kind: string;
+  title: string;
+  phase: "started" | "updated" | "completed";
+  ok?: boolean;
+  firstSeen: number;
+  detail?: Record<string, unknown>;
 };
 
-const demoRepos: Repo[] = [
-  {
-    id: "demo-repo-1",
-    name: "apollo",
-    root_path: "~/conductor/repos/apollo",
-    default_branch: "main",
-    remote_url: "https://github.com/example/apollo.git",
-  },
-  {
-    id: "demo-repo-2",
-    name: "atlas",
-    root_path: "~/conductor/repos/atlas",
-    default_branch: "main",
-    remote_url: "https://github.com/example/atlas.git",
-  },
+type AgentEvent = {
+  type: string;
+  engine?: string;
+  phase?: string;
+  ok?: boolean;
+  text?: string;
+  answer?: string;
+  error?: string;
+  resume?: string;
+  action?: {
+    id: string;
+    kind: string;
+    title: string;
+    detail?: Record<string, unknown>;
+  };
+};
+
+type Agent = {
+  id: string;
+  name: string;
+  description: string;
+};
+
+const AGENTS: Agent[] = [
+  { id: "claude-code", name: "Claude Code", description: "Full development assistant" },
+  { id: "codex", name: "Codex", description: "OpenAI Codex agent" },
+  { id: "gemini", name: "Gemini", description: "Google Gemini" },
 ];
 
-const demoWorkspaces: Workspace[] = [
-  {
-    id: "demo-ws-1",
-    repo_id: "demo-repo-1",
-    repo: "apollo",
-    name: "lahore",
-    branch: "lahore",
-    base_branch: "main",
-    state: "ready",
-    path: "~/conductor/workspaces/apollo-demo/lahore",
-  },
-  {
-    id: "demo-ws-2",
-    repo_id: "demo-repo-1",
-    repo: "apollo",
-    name: "oslo",
-    branch: "oslo",
-    base_branch: "main",
-    state: "ready",
-    path: "~/conductor/workspaces/apollo-demo/oslo",
-  },
-  {
-    id: "demo-ws-3",
-    repo_id: "demo-repo-2",
-    repo: "atlas",
-    name: "seoul",
-    branch: "seoul",
-    base_branch: "main",
-    state: "ready",
-    path: "~/conductor/workspaces/atlas-demo/seoul",
-  },
-  {
-    id: "demo-ws-4",
-    repo_id: "demo-repo-2",
-    repo: "atlas",
-    name: "kyoto",
-    branch: "kyoto",
-    base_branch: "main",
-    state: "ready",
-    path: "~/conductor/workspaces/atlas-demo/kyoto",
-  },
-];
+// formatActionKind and helpers moved to ./lib/tool-registry
 
-const demoFiles = [
-  "README.md",
-  "src/app.tsx",
-  "src/components/WorkspacePanel.tsx",
-  "src/components/WorkspaceTabs.tsx",
-  "src/hooks/useWorkspaces.ts",
-  "src/styles/theme.css",
-  "src/agent/plan.md",
-];
+// ActionMessage is now imported from ./lib/tool-registry
 
-const demoFilesByWorkspace: Record<string, string[]> = {
-  "demo-ws-1": demoFiles,
-  "demo-ws-2": demoFiles,
-  "demo-ws-3": demoFiles,
-  "demo-ws-4": demoFiles,
-};
+// ChatInput with @ file autocomplete, auto-expand, and integrated send/stop button
+function ChatInput({
+  value, onChange, onSend, onStop, placeholder, disabled, running, files,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  onSend: () => void;
+  onStop: () => void;
+  placeholder: string;
+  disabled: boolean;
+  running: boolean;
+  files: string[];
+}) {
+  const [showAutocomplete, setShowAutocomplete] = useState(false);
+  const [autocompleteQuery, setAutocompleteQuery] = useState("");
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [cursorPos, setCursorPos] = useState(0);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-const demoChangesByWorkspace: Record<string, WorkspaceChange[]> = {
-  "demo-ws-1": [
-    { path: "README.md", status: "M" },
-    { path: "src/app.tsx", status: "M" },
-    { path: "src/styles/theme.css", status: "M" },
-  ],
-  "demo-ws-2": [
-    { path: "src/components/WorkspaceTabs.tsx", status: "M" },
-    { path: "src/agent/plan.md", status: "A" },
-  ],
-  "demo-ws-3": [{ path: "src/components/WorkspacePanel.tsx", status: "M" }],
-};
+  // Auto-resize textarea
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 200)}px`;
+  }, [value]);
 
-const demoFileContents: Record<string, string> = {
-  "README.md": `# Conductor Desktop
+  // Create Fuse instance for fuzzy search
+  const fuse = useMemo(() => new Fuse(files, {
+    threshold: 0.4,
+    distance: 100,
+    includeScore: true,
+  }), [files]);
 
-Workspace switcher for multi-repo worktrees.
+  // Get search results
+  const results = useMemo(() => {
+    if (!autocompleteQuery) return files.slice(0, 10);
+    return fuse.search(autocompleteQuery).slice(0, 10).map(r => r.item);
+  }, [fuse, files, autocompleteQuery]);
 
-- Grouped tabs and workspace stacks
-- Fast repo add from URL
-- Inline diff viewer
-`,
-  "src/components/WorkspaceTabs.tsx": `export function WorkspaceTabs() {
+  // Handle text change and detect @ mentions
+  const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const newValue = e.target.value;
+    const pos = e.target.selectionStart;
+    onChange(newValue);
+    setCursorPos(pos);
+
+    // Check if we're in an @ mention context
+    const textBeforeCursor = newValue.slice(0, pos);
+    const atMatch = textBeforeCursor.match(/@([^\s@]*)$/);
+
+    if (atMatch) {
+      setAutocompleteQuery(atMatch[1]);
+      setShowAutocomplete(true);
+      setSelectedIndex(0);
+    } else {
+      setShowAutocomplete(false);
+      setAutocompleteQuery("");
+    }
+  };
+
+  // Handle keyboard navigation
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (showAutocomplete && results.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setSelectedIndex(i => Math.min(i + 1, results.length - 1));
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setSelectedIndex(i => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === "Tab" || e.key === "Enter") {
+        e.preventDefault();
+        selectFile(results[selectedIndex]);
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setShowAutocomplete(false);
+        return;
+      }
+    }
+
+    // Normal Enter to send (without autocomplete)
+    // Allow sending even when running (will be queued)
+    if (e.key === "Enter" && !e.shiftKey && !showAutocomplete) {
+      e.preventDefault();
+      if (value.trim() && !disabled) onSend();
+    }
+  };
+
+  const canSend = value.trim() && !disabled;
+  const showButton = canSend || running;
+
+  // Select a file from autocomplete
+  const selectFile = (file: string) => {
+    const textBeforeCursor = value.slice(0, cursorPos);
+    const textAfterCursor = value.slice(cursorPos);
+    const atMatch = textBeforeCursor.match(/@([^\s@]*)$/);
+
+    if (atMatch) {
+      const beforeAt = textBeforeCursor.slice(0, atMatch.index);
+      const newValue = `${beforeAt}@${file} ${textAfterCursor}`;
+      onChange(newValue);
+      setShowAutocomplete(false);
+      setAutocompleteQuery("");
+
+      // Focus back on textarea
+      setTimeout(() => {
+        if (textareaRef.current) {
+          const newPos = beforeAt.length + 1 + file.length + 1;
+          textareaRef.current.focus();
+          textareaRef.current.setSelectionRange(newPos, newPos);
+        }
+      }, 0);
+    }
+  };
+
   return (
-    <div className="tabs">
-      {/* grouped tab pills render here */}
+    <div className="chat-input-wrapper">
+      <textarea
+        ref={textareaRef}
+        className="input textarea"
+        placeholder={placeholder}
+        value={value}
+        onChange={handleChange}
+        onKeyDown={handleKeyDown}
+        disabled={disabled}
+      />
+      {showAutocomplete && results.length > 0 && (
+        <div className="autocomplete-dropdown">
+          {results.map((file, i) => {
+            const parts = file.split("/");
+            const fileName = parts.pop() || file;
+            const dirPath = parts.join("/");
+            return (
+              <button
+                key={file}
+                className={`autocomplete-item${i === selectedIndex ? " selected" : ""}`}
+                onClick={() => selectFile(file)}
+                onMouseEnter={() => setSelectedIndex(i)}
+              >
+                <span className="autocomplete-name">{fileName}</span>
+                {dirPath && <span className="autocomplete-path">{dirPath}/</span>}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {/* Integrated send/stop button */}
+      {showButton && (
+        <button
+          className={`input-action-btn ${running ? "stop" : "send"}`}
+          onClick={running ? onStop : onSend}
+          disabled={!running && !canSend}
+          title={running ? "Stop (Esc)" : "Send (Enter)"}
+        >
+          {running ? "■" : "↑"}
+        </button>
+      )}
     </div>
   );
 }
-`,
-  "src/hooks/useWorkspaces.ts": `export function useWorkspaces() {
-  return { workspaces: [], activeWorkspace: null };
+
+type AgentTab = {
+  id: string;
+  agentId: string;
+  name: string;
+  messages: ChatMessage[];
+  sessionId?: string;
+  resumeId?: string; // Claude session ID for --resume
+  running?: boolean;
+  startTime?: number; // Timestamp when agent started (for elapsed time)
+  actions: Map<string, ActionState>;
+};
+
+// Hook for elapsed time display (Takopi pattern)
+function useElapsedTime(startTime: number | undefined, running: boolean): string {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!running || !startTime) { setElapsed(0); return; }
+    const interval = setInterval(() => {
+      setElapsed(Date.now() - startTime);
+    }, 100);
+    return () => clearInterval(interval);
+  }, [running, startTime]);
+  if (!running || elapsed === 0) return "";
+  const secs = elapsed / 1000;
+  return secs < 60 ? `${secs.toFixed(1)}s` : `${Math.floor(secs / 60)}m ${(secs % 60).toFixed(0)}s`;
 }
-`,
-  "src/agent/plan.md": `# Plan
 
-- Sync workspace metadata
-- Render diff previews
-- Add repo URL flow
-`,
-};
-
-const demoDiffs: Record<string, string> = {
-  "README.md": `diff --git a/README.md b/README.md
-index 2c1d4b1..a3c5a07 100644
---- a/README.md
-+++ b/README.md
-@@ -1,3 +1,7 @@
--# Conductor
--Workspace switcher.
-+# Conductor Desktop
-+
-+Workspace switcher for multi-repo worktrees.
-+- Grouped tabs and workspace stacks
-+- Inline diff viewer
-`,
-  "src/app.tsx": `diff --git a/src/app.tsx b/src/app.tsx
-index 0c1f9ad..44b9e1a 100644
---- a/src/app.tsx
-+++ b/src/app.tsx
-@@ -12,7 +12,8 @@ export function WorkspacePanel() {
--  return <div className="panel">Workspace ready.</div>;
-+  return (
-+    <div className="panel">Workspace ready for review.</div>
-+  );
- }
-`,
-  "src/styles/theme.css": `diff --git a/src/styles/theme.css b/src/styles/theme.css
-index 0a13b10..b2a9c70 100644
---- a/src/styles/theme.css
-+++ b/src/styles/theme.css
-@@ -4,7 +4,8 @@
- :root {
--  --accent: #e4572e;
-+  --accent: #e4572e;
-+  --accent-soft: #f3b090;
- }
-`,
-  "src/components/WorkspaceTabs.tsx": `diff --git a/src/components/WorkspaceTabs.tsx b/src/components/WorkspaceTabs.tsx
-index 7ce19aa..e8f1a0e 100644
---- a/src/components/WorkspaceTabs.tsx
-+++ b/src/components/WorkspaceTabs.tsx
-@@ -1,4 +1,6 @@
- export function WorkspaceTabs() {
-   return (
-     <div className="tabs">
-+      {/* repo grouped tabs */}
-     </div>
-   );
- }
-`,
-  "src/components/WorkspacePanel.tsx": `diff --git a/src/components/WorkspacePanel.tsx b/src/components/WorkspacePanel.tsx
-index 4bb32b1..2d4a662 100644
---- a/src/components/WorkspacePanel.tsx
-+++ b/src/components/WorkspacePanel.tsx
-@@ -5,6 +5,7 @@ export function WorkspacePanel() {
-   return (
-     <section className="panel">
-+      <h2>Active workspace</h2>
-       <p>Workspace status ready.</p>
-     </section>
-   );
- }
-`,
-};
-
-const demoMessages: Record<string, ChatMessage[]> = {
-  "demo-ws-1": [
-    {
-      id: "demo-msg-1",
-      role: "system",
-      content: "Workspace ready. Base is main.",
-      meta: "agent",
-    },
-    {
-      id: "demo-msg-2",
-      role: "user",
-      content: "Summarize the diff vs main and list any risks.",
-      meta: "you",
-    },
-    {
-      id: "demo-msg-3",
-      role: "assistant",
-      content:
-        "Updated copy in the workspace panel and tweaked theme tokens. No behavior changes found.",
-      meta: "assistant",
-    },
-  ],
-  "demo-ws-2": [
-    {
-      id: "demo-msg-4",
-      role: "system",
-      content: "New branch created from main.",
-      meta: "agent",
-    },
-    {
-      id: "demo-msg-5",
-      role: "assistant",
-      content:
-        "I added a quick plan checklist and refreshed the tab renderer stub.",
-      meta: "assistant",
-    },
-  ],
-  default: [
-    {
-      id: "demo-msg-6",
-      role: "assistant",
-      content: "Open a workspace to see the conversation thread.",
-      meta: "assistant",
-    },
-  ],
-};
-
-const demoCityNames = [
-  "lahore",
-  "oslo",
-  "seoul",
-  "kyoto",
-  "lisbon",
-  "mumbai",
-  "helsinki",
-  "cairo",
-  "santiago",
-  "stockholm",
-  "porto",
-  "vienna",
-];
+// =============================================================================
+// Tauri API Helpers
+// =============================================================================
 
 const HOME_STORAGE_KEY = "conductor.home";
-const DEMO_HOME_BASE = "/home/demo";
-
-function pickDemoWorkspaceName(usedNames: Set<string>, nextId: number) {
-  const next =
-    demoCityNames.find((city) => !usedNames.has(city.toLowerCase())) ||
-    `workspace-${nextId}`;
-  return next;
-}
 
 function readStoredHome(): string {
   try {
@@ -318,58 +351,57 @@ function storeHome(value: string) {
       localStorage.removeItem(HOME_STORAGE_KEY);
     }
   } catch {
-    // Ignore storage failures.
+    // Ignore storage failures
   }
-}
-
-function resolveDemoHome(value: string) {
-  const trimmed = value.trim() || "~/conductor";
-  if (trimmed === "~") return DEMO_HOME_BASE;
-  if (trimmed.startsWith("~/")) return `${DEMO_HOME_BASE}/${trimmed.slice(2)}`;
-  return trimmed;
 }
 
 async function safeInvoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  if (typeof invoke !== "function") {
+    throw new Error("Tauri not available - are you running in the Tauri window?");
+  }
   return await invoke<T>(cmd, args);
 }
 
-function repoNameFromUrl(url: string) {
-  const trimmed = url.trim().replace(/\/+$/, "");
-  const last = trimmed.split("/").pop() ?? trimmed;
-  const tail = last.includes(":") ? last.split(":").pop() ?? last : last;
-  return tail.replace(/\.git$/, "") || "repo";
-}
+// =============================================================================
+// Utility Functions
+// =============================================================================
 
 function splitFilePath(path: string) {
   const idx = path.lastIndexOf("/");
-  if (idx === -1) {
-    return { dir: "", base: path };
-  }
+  if (idx === -1) return { dir: "", base: path };
   return { dir: path.slice(0, idx), base: path.slice(idx + 1) };
 }
 
 function statusLabel(status: string) {
   const code = status.startsWith("R") ? "R" : status;
   switch (code) {
-    case "A":
-      return "added";
-    case "D":
-      return "deleted";
-    case "M":
-      return "modified";
-    case "R":
-      return "renamed";
-    default:
-      return status;
+    case "A": return "added";
+    case "D": return "deleted";
+    case "M": return "modified";
+    case "R": return "renamed";
+    case "?": return "new";
+    default: return status;
   }
 }
 
 function statusClass(status: string) {
   const code = status[0]?.toLowerCase();
-  if (code === "a") return "status added";
+  if (code === "a" || code === "?") return "status added";
   if (code === "d") return "status deleted";
   if (code === "r") return "status renamed";
   return "status modified";
+}
+
+function getLangFromPath(path: string): string {
+  const ext = path.split(".").pop()?.toLowerCase() ?? "";
+  const langMap: Record<string, string> = {
+    ts: "typescript", tsx: "tsx", js: "javascript", jsx: "jsx",
+    css: "css", scss: "scss", less: "less", html: "html",
+    json: "json", md: "markdown", py: "python", rs: "rust",
+    go: "go", sh: "bash", bash: "bash", zsh: "bash",
+    yml: "yaml", yaml: "yaml", toml: "toml", sql: "sql",
+  };
+  return langMap[ext] ?? "plaintext";
 }
 
 const diffOptions = {
@@ -380,552 +412,448 @@ const diffOptions = {
   themeType: "light",
 } as const;
 
-type OpenGroup = {
-  repoId: string;
-  repoName: string;
-  workspaces: Workspace[];
-};
+// =============================================================================
+// Components
+// =============================================================================
 
-type RailProps = {
-  isDemo: boolean;
-  repos: Repo[];
-  workspaces: Workspace[];
-  openWorkspaceIds: string[];
-  activeWorkspaceId: string | null;
-  loading: boolean;
-  repoAdding: boolean;
-  homeDraft: string;
-  homeResolved: string;
-  homeDirty: boolean;
-  filter: string;
-  createRepoId: string;
-  createName: string;
-  creating: boolean;
-  createError: string | null;
-  repoUrl: string;
-  repoError: string | null;
-  collapsedRepoIds: Set<string>;
-  workspacesByRepo: Map<string, Workspace[]>;
-  openWorkspaces: Workspace[];
-  filteredWorkspaces: Workspace[];
-  onHomeDraftChange: (value: string) => void;
-  onApplyHome: () => void;
-  onRefresh: () => void;
-  onFilterChange: (value: string) => void;
-  onCreateRepoChange: (value: string) => void;
-  onCreateNameChange: (value: string) => void;
-  onCreateWorkspace: () => void;
-  onRepoUrlChange: (value: string) => void;
-  onAddRepo: () => void;
-  onToggleRepo: (repoId: string) => void;
-  onOpenWorkspace: (id: string) => void;
-};
+function CodePreview({ code, lang }: { code: string; lang: string }) {
+  const [html, setHtml] = useState<string>("");
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    codeToHtml(code, { lang: lang || "plaintext", theme: "github-light" })
+      .then((result) => { if (!cancelled) { setHtml(result); setLoading(false); } })
+      .catch(() => { if (!cancelled) { setHtml(""); setLoading(false); } });
+    return () => { cancelled = true; };
+  }, [code, lang]);
+
+  if (loading) return <div className="muted">Loading preview...</div>;
+  if (!html) return <pre className="file-content">{code}</pre>;
+  return <div className="code-preview" dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+function ResizeHandle({ onResize, direction }: { onResize: (delta: number) => void; direction: "left" | "right" }) {
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const handleMouseMove = (moveEvent: MouseEvent) => {
+      const delta = direction === "right" ? moveEvent.clientX - startX : startX - moveEvent.clientX;
+      onResize(delta);
+    };
+    const handleMouseUp = () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, [onResize, direction]);
+
+  return <div className="resize-handle" onMouseDown={handleMouseDown} />;
+}
+
+type OpenGroup = { repoId: string; repoName: string; workspaces: Workspace[] };
 
 function Rail({
-  isDemo,
-  repos,
-  workspaces,
-  openWorkspaceIds,
-  activeWorkspaceId,
-  loading,
-  repoAdding,
-  homeDraft,
-  homeResolved,
-  homeDirty,
-  filter,
-  createRepoId,
-  createName,
-  creating,
-  createError,
-  repoUrl,
-  repoError,
-  collapsedRepoIds,
-  workspacesByRepo,
-  openWorkspaces,
-  filteredWorkspaces,
-  onHomeDraftChange,
-  onApplyHome,
-  onRefresh,
-  onFilterChange,
-  onCreateRepoChange,
-  onCreateNameChange,
-  onCreateWorkspace,
-  onRepoUrlChange,
-  onAddRepo,
-  onToggleRepo,
-  onOpenWorkspace,
-}: RailProps) {
+  repos, workspaces, openWorkspaceIds, activeWorkspaceId, loading, repoAdding,
+  homeDraft, homeResolved, homeDirty, filter, creating, createError, repoUrl, repoError,
+  collapsedRepoIds, workspacesByRepo, filteredWorkspaces, repoUrlInputRef, showHomePopover,
+  onHomeDraftChange, onApplyHome, onRefresh, onFilterChange, onCreateWorkspaceForRepo,
+  onRepoUrlChange, onAddRepo, onToggleRepo, onOpenWorkspace, onToggleHomePopover,
+}: {
+  repos: Repo[]; workspaces: Workspace[]; openWorkspaceIds: string[];
+  activeWorkspaceId: string | null; loading: boolean; repoAdding: boolean;
+  homeDraft: string; homeResolved: string; homeDirty: boolean; filter: string;
+  creating: boolean; createError: string | null; repoUrl: string; repoError: string | null;
+  collapsedRepoIds: Set<string>; workspacesByRepo: Map<string, Workspace[]>;
+  filteredWorkspaces: Workspace[]; repoUrlInputRef: React.RefObject<HTMLInputElement | null>;
+  showHomePopover: boolean;
+  onHomeDraftChange: (v: string) => void; onApplyHome: () => void; onRefresh: () => void;
+  onFilterChange: (v: string) => void; onCreateWorkspaceForRepo: (id: string) => void;
+  onRepoUrlChange: (v: string) => void; onAddRepo: () => void;
+  onToggleRepo: (id: string) => void; onOpenWorkspace: (id: string) => void;
+  onToggleHomePopover: () => void;
+}) {
   return (
     <aside className="rail">
       <div className="brand">
-        <div className="brand-title">Conductor</div>
-        <div className="brand-sub">Workspace switcher</div>
-        {isDemo && <div className="badge demo">Design mode</div>}
-      </div>
-
-      <div className="card">
-        <div className="card-row">
-          <div>
-            <div className="card-title">Home</div>
-            <div className="card-meta">
-              {repos.length} repos / {workspaces.length} workspaces
-            </div>
-          </div>
-          <button className="btn ghost" onClick={onRefresh} disabled={loading || repoAdding}>
-            {loading ? "Refreshing" : "Refresh"}
-          </button>
+        <div>
+          <div className="brand-title">Conductor</div>
+          <div className="brand-sub">{repos.length} repos · {workspaces.length} workspaces</div>
         </div>
-        <div className="home-controls">
-          <input
-            className="input"
-            placeholder="~/conductor"
-            value={homeDraft}
-            onChange={(e) => onHomeDraftChange(e.currentTarget.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                onApplyHome();
-              }
-            }}
-          />
-          <button className="btn ghost" onClick={onApplyHome} disabled={!homeDirty || loading || repoAdding}>
-            Apply
-          </button>
-        </div>
-        {homeResolved && (
-          <div className="home-resolved">
-            Resolved: <span className="mono">{homeResolved}</span>
-          </div>
-        )}
-      </div>
-
-      <div className="card">
-        <div className="card-title">Add repo</div>
-        <label className="label" htmlFor="repo-url">
-          Repo URL
-        </label>
-        <input
-          id="repo-url"
-          className="input"
-          placeholder="https://github.com/org/repo"
-          value={repoUrl}
-          disabled={repoAdding}
-          onChange={(e) => onRepoUrlChange(e.currentTarget.value)}
-        />
-        <button className="btn primary" onClick={onAddRepo} disabled={repoAdding}>
-          {repoAdding ? "Adding" : "Add repo"}
-        </button>
-        {repoAdding && <div className="help-text">Cloning repository...</div>}
-        {repoError && <div className="inline-error">{repoError}</div>}
-      </div>
-
-      <div className="card">
-        <div className="card-title">New workspace</div>
-        {!repos.length ? (
-          <div className="muted">Add a repo before creating a workspace.</div>
-        ) : (
-          <>
-            <label className="label" htmlFor="repo-select">
-              Repo
-            </label>
-            <select
-              id="repo-select"
-              className="input select"
-              value={createRepoId}
-              onChange={(e) => onCreateRepoChange(e.currentTarget.value)}
-              disabled={repoAdding}
-            >
-              {repos.map((repo) => (
-                <option key={repo.id} value={repo.id}>
-                  {repo.name}
-                </option>
-              ))}
-            </select>
-            <label className="label" htmlFor="workspace-name">
-              Name
-            </label>
-            <input
-              id="workspace-name"
-              className="input"
-              placeholder="Leave blank for a city name"
-              value={createName}
-              onChange={(e) => onCreateNameChange(e.currentTarget.value)}
-              disabled={repoAdding}
-            />
-            <button className="btn primary" onClick={onCreateWorkspace} disabled={creating || repoAdding}>
-              {creating ? "Creating" : "Create workspace"}
-            </button>
-            {isDemo && <div className="muted">Design mode uses sample data. New workspaces are local only.</div>}
-            {createError && <div className="inline-error">{createError}</div>}
-          </>
-        )}
       </div>
 
       <div className="card grow">
         <div className="card-row">
-          <div>
-            <div className="card-title">Workspaces</div>
-            <div className="card-meta">
-              {openWorkspaceIds.length} open / {workspaces.length} total
-            </div>
-          </div>
-          <input
-            className="input small"
-            placeholder="Filter"
-            value={filter}
-            onChange={(e) => onFilterChange(e.currentTarget.value)}
-          />
+          <div className="card-title">Workspaces</div>
+          <input className="input small" placeholder="Filter..." value={filter}
+            onChange={(e) => onFilterChange(e.currentTarget.value)} style={{ width: 100 }} />
         </div>
         <div className="repo-list">
           {repos.map((repo) => {
             const repoWorkspaces = workspacesByRepo.get(repo.id) ?? [];
-            if (filter && repoWorkspaces.length === 0) {
-              return null;
-            }
+            if (filter && repoWorkspaces.length === 0) return null;
             const isCollapsed = collapsedRepoIds.has(repo.id);
-            const openCount = openWorkspaces.filter((ws) => ws.repo_id === repo.id).length;
             return (
               <div key={repo.id} className="repo-group">
-                <button className="repo-header" onClick={() => onToggleRepo(repo.id)}>
-                  <div>
-                    <div className="repo-title">{repo.name}</div>
-                    <div className="repo-meta">
-                      {repoWorkspaces.length} workspaces / {openCount} open
+                <div className="repo-header-row">
+                  <button className="repo-header" onClick={() => onToggleRepo(repo.id)}>
+                    <div>
+                      <div className="repo-title">{repo.name}</div>
+                      <div className="repo-meta">{repoWorkspaces.length} workspaces</div>
                     </div>
-                  </div>
-                  <div className={`repo-toggle${isCollapsed ? " collapsed" : ""}`}>v</div>
-                </button>
+                    <span className={`repo-toggle${isCollapsed ? " collapsed" : ""}`}>▾</span>
+                  </button>
+                  <button className="btn ghost small repo-add" onClick={() => onCreateWorkspaceForRepo(repo.id)}
+                    disabled={creating || repoAdding} title="New workspace">+</button>
+                </div>
                 {!isCollapsed && (
                   <div className="workspace-list">
                     {repoWorkspaces.map((ws) => {
                       const isOpen = openWorkspaceIds.includes(ws.id);
                       const isActive = ws.id === activeWorkspaceId;
                       return (
-                        <button
-                          key={ws.id}
-                          className={`workspace-item${isActive ? " active" : ""}`}
-                          onClick={() => onOpenWorkspace(ws.id)}
-                        >
+                        <button key={ws.id} className={`workspace-item${isActive ? " active" : ""}`}
+                          onClick={() => onOpenWorkspace(ws.id)}>
                           <div className="workspace-row">
-                            <div className="workspace-name">{ws.name}</div>
+                            <span className="workspace-name">{ws.name}</span>
                             {isActive && <span className="badge active">Active</span>}
                             {!isActive && isOpen && <span className="badge open">Open</span>}
                           </div>
                           <div className="workspace-meta">
-                            <span>{ws.branch}</span>
-                            <span className="sep">/</span>
-                            <span>{ws.state}</span>
+                            <span>{ws.branch}</span><span className="sep">·</span><span>{ws.state}</span>
                           </div>
                         </button>
                       );
                     })}
-                    {!repoWorkspaces.length && <div className="muted">No workspaces yet.</div>}
                   </div>
                 )}
+                {createError && <div className="inline-error" style={{ paddingLeft: 12 }}>{createError}</div>}
               </div>
             );
           })}
-          {!repos.length && <div className="muted">Add a repo to get started.</div>}
+          {!repos.length && <div className="muted">Add a repo below to get started.</div>}
           {repos.length > 0 && filter && filteredWorkspaces.length === 0 && (
-            <div className="muted">No workspaces match "{filter}".</div>
+            <div className="muted">No matches for "{filter}"</div>
           )}
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-title">Add repo</div>
+        <div className="repo-url-row">
+          <input ref={repoUrlInputRef} className="input small" placeholder="https://github.com/org/repo" value={repoUrl}
+            disabled={repoAdding} onChange={(e) => onRepoUrlChange(e.currentTarget.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); onAddRepo(); } }} />
+          <button className="btn primary small" onClick={onAddRepo} disabled={repoAdding}>
+            {repoAdding ? "..." : "Add"}
+          </button>
+        </div>
+        {repoError && <div className="inline-error">{repoError}</div>}
+      </div>
+
+      <div className="rail-footer">
+        <div className="rail-footer-left">
+          {homeResolved && <span className="home-path-hint mono" title={homeResolved}>{homeResolved}</span>}
+        </div>
+        <div className="rail-footer-actions">
+          <button className="btn ghost small" onClick={onRefresh} disabled={loading || repoAdding} title="Refresh">
+            {loading ? "..." : "↻"}
+          </button>
+          <div className="home-popover-container">
+            <button className={`btn ghost small${showHomePopover ? " active" : ""}`} onClick={onToggleHomePopover} title="Settings">
+              ⚙
+            </button>
+            {showHomePopover && (
+              <div className="home-popover">
+                <div className="home-popover-header">
+                  <span className="home-popover-title">Home Directory</span>
+                </div>
+                <div className="home-popover-body">
+                  <input className="input small" placeholder="~/conductor" value={homeDraft}
+                    onChange={(e) => onHomeDraftChange(e.currentTarget.value)}
+                    onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); onApplyHome(); onToggleHomePopover(); } }} />
+                  <button className="btn primary small" onClick={() => { onApplyHome(); onToggleHomePopover(); }} disabled={!homeDirty || loading}>
+                    Apply
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </aside>
   );
 }
 
-type TabsHeaderProps = {
-  openGroups: OpenGroup[];
-  activeWorkspaceId: string | null;
-  canPrev: boolean;
-  canNext: boolean;
-  onActivate: (id: string) => void;
-  onClose: (id: string) => void;
-  onPrev: () => void;
-  onNext: () => void;
-};
-
-function TabsHeader({
-  openGroups,
-  activeWorkspaceId,
-  canPrev,
-  canNext,
-  onActivate,
-  onClose,
-  onPrev,
-  onNext,
-}: TabsHeaderProps) {
+function TabsHeader({ openGroups, activeWorkspaceId, canPrev, canNext, onActivate, onClose, onPrev, onNext }: {
+  openGroups: OpenGroup[]; activeWorkspaceId: string | null;
+  canPrev: boolean; canNext: boolean;
+  onActivate: (id: string) => void; onClose: (id: string) => void;
+  onPrev: () => void; onNext: () => void;
+}) {
   return (
     <header className="tabs-header">
       <div className="tabs">
         {openGroups.map((group) => (
           <div key={group.repoId} className="tab-group">
-            <div className="tab-group-title">{group.repoName}</div>
+            <span className="tab-group-title">{group.repoName}</span>
             <div className="tab-group-list">
               {group.workspaces.map((ws) => (
                 <div key={ws.id} className={`tab-pill${ws.id === activeWorkspaceId ? " active" : ""}`}>
                   <button className="tab-hit" onClick={() => onActivate(ws.id)}>
-                    <div className="tab-title">{ws.name}</div>
-                    <div className="tab-meta">{ws.branch}</div>
+                    <span className="tab-title">{ws.name}</span>
                   </button>
-                  <button className="tab-close" onClick={() => onClose(ws.id)} aria-label={`Close ${ws.name}`}>
-                    <span aria-hidden="true">×</span>
-                    <span className="sr-only">Close</span>
-                  </button>
+                  <button className="tab-close" onClick={() => onClose(ws.id)} aria-label={`Close ${ws.name}`}>×</button>
                 </div>
               ))}
             </div>
           </div>
         ))}
-        {!openGroups.length && <div className="tab-empty muted">Open a workspace to start.</div>}
+        {!openGroups.length && <span className="tab-empty">Open a workspace to start</span>}
       </div>
       <div className="tab-actions">
-        <button className="btn ghost" onClick={onPrev} disabled={!canPrev} title="Previous tab">
-          Prev tab
-        </button>
-        <button className="btn ghost" onClick={onNext} disabled={!canNext} title="Next tab">
-          Next tab
-        </button>
+        <button className="btn ghost small" onClick={onPrev} disabled={!canPrev} title="Previous">←</button>
+        <button className="btn ghost small" onClick={onNext} disabled={!canNext} title="Next">→</button>
       </div>
     </header>
   );
 }
 
-type WorkspacePanelProps = {
-  activeWorkspace: Workspace | null;
-};
+function WelcomeHero({ hasRepos, onAddRepoFocus }: { hasRepos: boolean; onAddRepoFocus: () => void }) {
+  return (
+    <div className="welcome-hero">
+      <div className="welcome-content">
+        <h1 className="welcome-title">Welcome to Conductor</h1>
+        <p className="welcome-subtitle">
+          {hasRepos
+            ? "Select a workspace from the sidebar to get started, or create a new one."
+            : "Manage your AI-assisted development workspaces in one place."}
+        </p>
+        <div className="welcome-actions">
+          {!hasRepos && (
+            <button className="btn primary welcome-btn" onClick={onAddRepoFocus}>
+              Add your first repository
+            </button>
+          )}
+          <a
+            href="https://github.com/your-org/conductor"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="btn welcome-btn"
+          >
+            Open Documentation
+          </a>
+        </div>
+        <div className="welcome-hints">
+          <div className="welcome-hint">
+            <span className="welcome-hint-icon">+</span>
+            <span>Click the + button on any repo to create a workspace</span>
+          </div>
+          <div className="welcome-hint">
+            <span className="welcome-hint-icon">@</span>
+            <span>Use @ mentions in chat to reference files</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
 
-function WorkspacePanel({ activeWorkspace }: WorkspacePanelProps) {
+function WorkspacePanel({ activeWorkspace }: { activeWorkspace: Workspace | null }) {
   return (
     <div className="panel-card primary">
       {activeWorkspace ? (
         <>
-          <div className="panel-kicker">Active workspace</div>
-          <div className="panel-title">{activeWorkspace.name}</div>
-          <div className="panel-route">
-            <span>{activeWorkspace.repo}</span>
-            <span className="route-dot">/</span>
-            <span>{activeWorkspace.branch}</span>
-          </div>
-          <div className="chip-row">
-            <span className="chip">State: {activeWorkspace.state}</span>
-            <span className="chip">Base: {activeWorkspace.base_branch}</span>
-          </div>
-          <div className="panel-grid">
-            <div className="panel-item">
-              <div className="panel-label">Path</div>
-              <div className="mono">{activeWorkspace.path}</div>
+          <div className="card-row">
+            <div>
+              <div className="panel-title">{activeWorkspace.name}</div>
+              <div className="panel-route">{activeWorkspace.repo} / {activeWorkspace.branch}</div>
             </div>
-            <div className="panel-item">
-              <div className="panel-label">Workspace ID</div>
-              <div className="mono">{activeWorkspace.id}</div>
+            <div className="chip-row">
+              <span className="chip">{activeWorkspace.state}</span>
+              <span className="chip">← {activeWorkspace.base_branch}</span>
             </div>
+          </div>
+          <div className="panel-item">
+            <span className="panel-label">Path</span>
+            <span className="mono">{activeWorkspace.path}</span>
           </div>
         </>
       ) : (
-        <div className="panel-empty">Pick a workspace to view details.</div>
+        <div className="panel-empty">Select a workspace</div>
       )}
     </div>
   );
 }
 
-type ChatPanelProps = {
-  activeWorkspace: Workspace | null;
-  chatEnabled: boolean;
-  chatStatus: string;
-  chatMessages: ChatMessage[];
-  chatDraft: string;
-  onDraftChange: (value: string) => void;
-  onSend: () => void;
-  chatEndRef: { current: HTMLDivElement | null };
-};
-
 function ChatPanel({
-  activeWorkspace,
-  chatEnabled,
-  chatStatus,
-  chatMessages,
-  chatDraft,
-  onDraftChange,
-  onSend,
-  chatEndRef,
-}: ChatPanelProps) {
+  activeWorkspace, tabs, activeTabId, chatDraft, running, startTime, files,
+  onTabChange, onTabClose, onTabAdd, onAgentChange, onDraftChange, onSend, onStop, chatEndRef,
+}: {
+  activeWorkspace: Workspace | null;
+  tabs: AgentTab[]; activeTabId: string | null; chatDraft: string; running: boolean;
+  startTime?: number; files: string[];
+  onTabChange: (id: string) => void; onTabClose: (id: string) => void;
+  onTabAdd: () => void; onAgentChange: (id: string) => void;
+  onDraftChange: (v: string) => void; onSend: () => void; onStop: () => void;
+  chatEndRef: { current: HTMLDivElement | null };
+}) {
+  const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
+  const activeAgent = AGENTS.find((a) => a.id === activeTab?.agentId) ?? AGENTS[0];
+  const elapsedTime = useElapsedTime(startTime, running);
+
   return (
     <div className="panel-card chat">
-      <div className="card-row">
-        <div>
-          <div className="card-title">Conversation</div>
-          <div className="card-meta">
-            {activeWorkspace ? `${activeWorkspace.repo} / ${activeWorkspace.name}` : "No workspace selected"}
-          </div>
+      <div className="agent-tabs">
+        <div className="agent-tabs-list">
+          {tabs.map((tab) => {
+            const agent = AGENTS.find((a) => a.id === tab.agentId) ?? AGENTS[0];
+            const isActive = tab.id === activeTabId;
+            return (
+              <div key={tab.id} className={`agent-tab${isActive ? " active" : ""}${tab.running ? " running" : ""}`}>
+                <button className="agent-tab-btn" onClick={() => onTabChange(tab.id)}>
+                  <span className="agent-tab-name">{agent.name}</span>
+                  {tab.messages.length > 0 && <span className="agent-tab-count">{tab.messages.length}</span>}
+                  {tab.running && <span className="agent-tab-spinner">●</span>}
+                </button>
+                {tabs.length > 1 && (
+                  <button className="agent-tab-close" onClick={(e) => { e.stopPropagation(); onTabClose(tab.id); }}>×</button>
+                )}
+              </div>
+            );
+          })}
+          <button className="btn ghost small agent-tab-add" onClick={onTabAdd} disabled={!activeWorkspace}>+</button>
         </div>
-        <span className={`badge${chatEnabled ? "" : " offline"}`}>{chatStatus}</span>
+        <div className="status-area">
+          {running && elapsedTime && <span className="elapsed-time">{elapsedTime}</span>}
+          <span className={`badge${running ? " running" : ""}`}>{running ? "Running" : "Ready"}</span>
+        </div>
       </div>
+
       <div className="chat-body">
-        {chatMessages.length ? (
-          chatMessages.map((msg) => (
-            <div key={msg.id} className={`chat-message ${msg.role}`}>
-              <div className="chat-meta">{msg.meta}</div>
-              <div className="chat-content">{msg.content}</div>
-            </div>
-          ))
+        {activeTab && activeTab.messages.length ? (
+          activeTab.messages.map((msg) => {
+            if (msg.role === "action") {
+              return <ActionMessage key={msg.id} msg={msg} workspacePath={activeWorkspace?.path} />;
+            }
+            return (
+              <div key={msg.id} className={`chat-message ${msg.role}${msg.meta === "queued" ? " queued" : ""}`}>
+                <span className="chat-meta">{msg.meta === "queued" ? "you" : msg.meta}</span>
+                <span className="chat-content">{msg.content}</span>
+              </div>
+            );
+          })
         ) : (
-          <div className="muted">
-            {chatEnabled ? "Messages will appear here." : "Connect a runner to stream messages here."}
-          </div>
+          <div className="muted">Send a message to start</div>
         )}
         <div ref={chatEndRef} />
       </div>
+
       <div className="chat-input">
-        <textarea
-          className="input textarea"
-          placeholder={
-            !activeWorkspace
-              ? "Select a workspace to chat"
-              : chatEnabled
-                ? "Ask the workspace agent..."
-                : "Connect a runner to chat"
-          }
-          value={chatDraft}
-          onChange={(e) => onDraftChange(e.currentTarget.value)}
-          disabled={!activeWorkspace || !chatEnabled}
-        />
-        <button className="btn primary" onClick={onSend} disabled={!chatDraft.trim() || !activeWorkspace || !chatEnabled}>
-          Send
-        </button>
+        <div className="chat-input-row">
+          <select className="agent-picker" value={activeTab?.agentId ?? "claude-code"}
+            onChange={(e) => onAgentChange(e.currentTarget.value)} disabled={!activeWorkspace || !activeTab || running}>
+            {AGENTS.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+          </select>
+          <ChatInput
+            value={chatDraft}
+            onChange={onDraftChange}
+            onSend={onSend}
+            onStop={onStop}
+            placeholder={!activeWorkspace ? "Select workspace" : `Message ${activeAgent.name}... (@ for files)`}
+            disabled={!activeWorkspace || !activeTab}
+            running={running}
+            files={files}
+          />
+        </div>
       </div>
     </div>
   );
 }
 
-type FilesPanelProps = {
-  activeWorkspace: Workspace | null;
-  files: string[];
-  changes: WorkspaceChange[];
-  filteredChanges: WorkspaceChange[];
-  filteredAllFiles: string[];
-  filesLoading: boolean;
-  fileFilter: string;
-  showAllFiles: boolean;
-  selectedFile: string | null;
-  fileError: string | null;
-  fileDiff: string | null;
-  fileContent: string | null;
-  fileViewLoading: boolean;
-  onFileFilterChange: (value: string) => void;
-  onToggleShowAll: () => void;
-  onSelectFile: (path: string) => void;
-};
-
 function FilesPanel({
-  activeWorkspace,
-  files,
-  changes,
-  filteredChanges,
-  filteredAllFiles,
-  filesLoading,
-  fileFilter,
-  showAllFiles,
-  selectedFile,
-  fileError,
-  fileDiff,
-  fileContent,
-  fileViewLoading,
-  onFileFilterChange,
-  onToggleShowAll,
-  onSelectFile,
-}: FilesPanelProps) {
+  activeWorkspace, files, changes, filteredChanges, filteredAllFiles, filesLoading,
+  fileFilter, showAllFiles, selectedFile, fileError, fileDiff, fileContent, fileViewLoading,
+  onFileFilterChange, onToggleShowAll, onSelectFile,
+}: {
+  activeWorkspace: Workspace | null; files: string[]; changes: WorkspaceChange[];
+  filteredChanges: WorkspaceChange[]; filteredAllFiles: string[];
+  filesLoading: boolean; fileFilter: string; showAllFiles: boolean;
+  selectedFile: string | null; fileError: string | null;
+  fileDiff: string | null; fileContent: string | null; fileViewLoading: boolean;
+  onFileFilterChange: (v: string) => void; onToggleShowAll: () => void; onSelectFile: (p: string) => void;
+}) {
   return (
     <aside className="files-panel">
       <div className="panel-card">
         <div className="card-row">
-          <div>
-            <div className="card-title">Files</div>
-            <div className="card-meta">
-              {activeWorkspace ? `Changed: ${changes.length} · Files: ${files.length}` : "No workspace selected"}
-            </div>
-          </div>
-          {filesLoading && <span className="badge">Loading</span>}
+          <span className="card-title">Files</span>
+          <span className="card-meta">{activeWorkspace ? `${changes.length} changed` : "—"}</span>
         </div>
         <div className="file-controls">
-          <input
-            className="input small"
-            placeholder="Filter files"
-            value={fileFilter}
-            onChange={(e) => onFileFilterChange(e.currentTarget.value)}
-            disabled={!activeWorkspace || filesLoading}
-          />
-          <button
-            className="btn ghost small"
-            onClick={onToggleShowAll}
-            disabled={!activeWorkspace || filesLoading || files.length === 0}
-          >
-            {showAllFiles ? "Hide all" : "Show all"}
+          <input className="input small" placeholder="Filter..." value={fileFilter}
+            onChange={(e) => onFileFilterChange(e.currentTarget.value)} disabled={!activeWorkspace || filesLoading} />
+          <button className="btn ghost small" onClick={onToggleShowAll}
+            disabled={!activeWorkspace || filesLoading || files.length === 0}>
+            {showAllFiles ? "Changed" : "All"}
           </button>
         </div>
         <div className="file-list">
-          {!activeWorkspace && <div className="muted">Select a workspace to browse files.</div>}
-          {activeWorkspace && !filesLoading && files.length === 0 && <div className="muted">No files available.</div>}
+          {!activeWorkspace && <div className="muted">Select workspace</div>}
+          {activeWorkspace && filesLoading && <div className="muted">Loading...</div>}
+          {activeWorkspace && !filesLoading && files.length === 0 && <div className="muted">No files</div>}
           {activeWorkspace && !filesLoading && files.length > 0 && (
             <>
-              <div className="file-section">
-                <div className="file-section-title">Changed ({filteredChanges.length})</div>
-                {filteredChanges.length ? (
-                  filteredChanges.map((change) => {
+              {filteredChanges.length > 0 && (
+                <div className="file-section">
+                  <div className="file-section-title">Changed ({filteredChanges.length})</div>
+                  {filteredChanges.map((change) => {
                     const { dir, base } = splitFilePath(change.path);
                     const isActive = change.path === selectedFile;
                     return (
-                      <button
-                        key={change.path}
-                        className={`file-item${isActive ? " active" : ""}`}
-                        onClick={() => onSelectFile(change.path)}
-                      >
+                      <button key={change.path} className={`file-item${isActive ? " active" : ""}`}
+                        onClick={() => onSelectFile(change.path)}>
                         <div className="file-main">
-                          <div className="file-path">
+                          <span className="file-path">
                             {dir && <span className="file-dir">{dir}/</span>}
                             <span className="file-name">{base}</span>
-                          </div>
-                          {change.old_path && <div className="file-rename">from {change.old_path}</div>}
+                          </span>
+                          {change.old_path && <span className="file-rename">← {change.old_path}</span>}
                         </div>
                         <span className={`file-status ${statusClass(change.status)}`} title={statusLabel(change.status)}>
-                          {change.status}
+                          {statusLabel(change.status)}
                         </span>
                       </button>
                     );
-                  })
-                ) : (
-                  <div className="muted">No changed files.</div>
-                )}
-              </div>
-              {showAllFiles && (
-                <div className="file-section">
-                  <div className="file-section-title">All files ({filteredAllFiles.length})</div>
-                  {filteredAllFiles.length ? (
-                    filteredAllFiles.map((file) => {
-                      const { dir, base } = splitFilePath(file);
-                      const isActive = file === selectedFile;
-                      return (
-                        <button
-                          key={file}
-                          className={`file-item${isActive ? " active" : ""}`}
-                          onClick={() => onSelectFile(file)}
-                        >
-                          <div className="file-main">
-                            <div className="file-path">
-                              {dir && <span className="file-dir">{dir}/</span>}
-                              <span className="file-name">{base}</span>
-                            </div>
-                          </div>
-                        </button>
-                      );
-                    })
-                  ) : (
-                    <div className="muted">No matching files.</div>
-                  )}
+                  })}
                 </div>
               )}
-              {!showAllFiles && <div className="muted">Show all files to browse everything.</div>}
+              {showAllFiles && filteredAllFiles.length > 0 && (
+                <div className="file-section">
+                  <div className="file-section-title">All ({filteredAllFiles.length})</div>
+                  {filteredAllFiles.map((file) => {
+                    const { dir, base } = splitFilePath(file);
+                    const isActive = file === selectedFile;
+                    return (
+                      <button key={file} className={`file-item${isActive ? " active" : ""}`}
+                        onClick={() => onSelectFile(file)}>
+                        <div className="file-main">
+                          <span className="file-path">
+                            {dir && <span className="file-dir">{dir}/</span>}
+                            <span className="file-name">{base}</span>
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </>
           )}
         </div>
@@ -933,72 +861,119 @@ function FilesPanel({
 
       <div className="panel-card diff">
         <div className="card-row">
-          <div>
-            <div className="card-title">File preview</div>
-            <div className="card-meta">{selectedFile ?? "Select a file"}</div>
-          </div>
+          <span className="card-title">Preview</span>
           {fileViewLoading && <span className="badge">Loading</span>}
         </div>
+        {selectedFile && <div className="card-meta mono">{selectedFile}</div>}
         <div className="diff-body">
           {fileError && <div className="inline-error">{fileError}</div>}
-          {!fileError && !selectedFile && <div className="muted">Pick a file to inspect changes.</div>}
+          {!fileError && !selectedFile && <div className="muted">Select a file</div>}
           {!fileError && selectedFile && fileDiff && (
-            <div className="diff-viewer">
-              <PatchDiff patch={fileDiff} options={diffOptions} />
-            </div>
+            <div className="diff-viewer"><PatchDiff patch={fileDiff} options={diffOptions} /></div>
           )}
           {!fileError && selectedFile && !fileDiff && fileContent && (
-            <pre className="file-content">{fileContent}</pre>
+            <CodePreview code={fileContent} lang={getLangFromPath(selectedFile)} />
           )}
-          {!fileError && selectedFile && !fileDiff && !fileContent && <div className="muted">No preview available.</div>}
+          {!fileError && selectedFile && !fileDiff && !fileContent && <div className="muted">No preview</div>}
         </div>
       </div>
     </aside>
   );
 }
 
+// =============================================================================
+// Main App
+// =============================================================================
+
 function App() {
-  const isDemo = typeof (window as { __TAURI__?: unknown }).__TAURI__ === "undefined";
+  // Query client for manual invalidation
+  const queryClient = useQueryClient();
+
+  // Core app state
   const [home, setHome] = useState<string>(() => readStoredHome());
   const [homeDraft, setHomeDraft] = useState<string>(() => readStoredHome());
   const [homeResolved, setHomeResolved] = useState<string>("");
-  const [repos, setRepos] = useState<Repo[]>([]);
-  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
+
+  // TanStack Query hooks for server state
+  const { data: repos = [], isLoading: reposLoading, error: reposError } = useRepos(home || undefined);
+  const { data: workspaces = [], isLoading: workspacesLoading, error: workspacesError } = useWorkspaces(home || undefined);
+
+  // UI state
   const [openWorkspaceIds, setOpenWorkspaceIds] = useState<string[]>([]);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState("");
-  const [createRepoId, setCreateRepoId] = useState("");
-  const [createName, setCreateName] = useState("");
-  const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState<string | null>(null);
   const [repoUrl, setRepoUrl] = useState("");
-  const [repoAdding, setRepoAdding] = useState(false);
-  const [repoError, setRepoError] = useState<string | null>(null);
   const [collapsedRepoIds, setCollapsedRepoIds] = useState<Set<string>>(new Set());
-  const [files, setFiles] = useState<string[]>([]);
-  const [changes, setChanges] = useState<WorkspaceChange[]>([]);
-  const [filesLoading, setFilesLoading] = useState(false);
-  const [fileViewLoading, setFileViewLoading] = useState(false);
   const [selectedFile, setSelectedFile] = useState<string | null>(null);
   const [fileFilter, setFileFilter] = useState("");
   const [showAllFiles, setShowAllFiles] = useState(false);
-  const [fileContent, setFileContent] = useState<string | null>(null);
-  const [fileDiff, setFileDiff] = useState<string | null>(null);
-  const [fileError, setFileError] = useState<string | null>(null);
   const [chatDraft, setChatDraft] = useState("");
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
-  const [demoLoaded, setDemoLoaded] = useState(false);
-  const [demoSeeded, setDemoSeeded] = useState(false);
-  const demoNextId = useRef(demoWorkspaces.length + 1);
-  const demoNextRepoId = useRef(demoRepos.length + 1);
-  const chatStore = useRef(new Map<string, ChatMessage[]>());
-  const chatEndRef = useRef<HTMLDivElement | null>(null);
-  const filesReq = useRef(0);
-  const previewReq = useRef(0);
-  const lastRefreshHome = useRef<string | null>(null);
+  const [queuedMessage, setQueuedMessage] = useState<string | null>(null);
+  const queuedMessageRef = useRef<string | null>(null);
+  const [agentTabs, setAgentTabs] = useState<AgentTab[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const [terminalOpen, setTerminalOpen] = useState(false);
 
+  // Derive loading/error from queries
+  const loading = reposLoading || workspacesLoading;
+  const error = reposError?.message ?? workspacesError?.message ?? null;
+
+  // Mutations
+  const addRepoMutation = useAddRepo(home || undefined);
+  const createWorkspaceMutation = useCreateWorkspace(home || undefined);
+  const repoAdding = addRepoMutation.isPending;
+  const repoError = addRepoMutation.error?.message ?? null;
+  const creating = createWorkspaceMutation.isPending;
+  const createError = createWorkspaceMutation.error?.message ?? null;
+
+  // Compute running state early (needed for queue effect)
+  const activeTab = agentTabs.find((t) => t.id === activeTabId) ?? null;
+  const running = activeTab?.running ?? false;
+
+  // Keep ref in sync with state (for use in event handlers)
+  useEffect(() => { queuedMessageRef.current = queuedMessage; }, [queuedMessage]);
+
+  // State to trigger sending a queued message (avoids stale closure issues)
+  const [pendingSendMessage, setPendingSendMessage] = useState<string | null>(null);
+
+  // Process queued message when agent finishes (running becomes false)
+  const prevRunningRef = useRef(false);
+  useEffect(() => {
+    const wasRunning = prevRunningRef.current;
+    prevRunningRef.current = running;
+    // If we just stopped running and have a queued message, trigger send
+    if (wasRunning && !running && queuedMessage) {
+      setPendingSendMessage(queuedMessage);
+      setQueuedMessage(null);
+    }
+  }, [running, queuedMessage]);
+  const [sidebarWidth, setSidebarWidth] = useState(280);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [filesWidth, setFilesWidth] = useState(360);
+  const [filesCollapsed, setFilesCollapsed] = useState(false);
+  const [showHomePopover, setShowHomePopover] = useState(false);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+
+  // Global keyboard shortcut for command palette
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        setCommandPaletteOpen((open) => !open);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  // Refs
+  const tabStore = useRef(new Map<string, AgentTab[]>());
+  const tabIdCounter = useRef(1);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const agentSessionRef = useRef<{ wsId: string; tabId: string; sessionId: string } | null>(null);
+  const repoUrlInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Derived state
   const workspaceById = useMemo(() => {
     const map = new Map<string, Workspace>();
     for (const ws of workspaces) map.set(ws.id, ws);
@@ -1007,32 +982,63 @@ function App() {
 
   const openWorkspaces = useMemo(
     () => openWorkspaceIds.map((id) => workspaceById.get(id)).filter(Boolean) as Workspace[],
-    [openWorkspaceIds, workspaceById],
+    [openWorkspaceIds, workspaceById]
   );
 
   const activeWorkspace = activeWorkspaceId ? workspaceById.get(activeWorkspaceId) ?? null : null;
 
+  // Workspace files and changes queries (depend on activeWorkspace)
+  const { data: files = [], isLoading: filesLoading } = useWorkspaceFiles(home || undefined, activeWorkspaceId);
+  const { data: changes = [] } = useWorkspaceChanges(home || undefined, activeWorkspaceId);
+
+  // Session persistence hooks
+  const { data: sessionState } = useSession(activeWorkspace?.path ?? null);
+  const { data: chatHistory } = useChat(activeWorkspace?.path ?? null);
+  const upsertResumeIdMutation = useUpsertResumeId();
+  const appendChatMutation = useAppendChat();
+
+  // Auto-select first file when files change
+  const prevFilesRef = useRef<string[]>([]);
+  useEffect(() => {
+    if (files !== prevFilesRef.current && files.length > 0 && !selectedFile) {
+      const firstChange = changes[0]?.path;
+      setSelectedFile(firstChange ?? files[0] ?? null);
+    }
+    prevFilesRef.current = files;
+  }, [files, changes, selectedFile]);
+
+  // File content and diff queries (depend on selectedFile)
+  const isChangedFile = selectedFile ? changes.some(c => c.path === selectedFile) : false;
+  const { data: fileDiff, isLoading: diffLoading, error: diffError } = useFileDiff(
+    home || undefined,
+    activeWorkspaceId,
+    isChangedFile ? selectedFile : null
+  );
+  const { data: fileContent, isLoading: contentLoading, error: contentError } = useFileContent(
+    home || undefined,
+    activeWorkspaceId,
+    // Only fetch content if no diff or diff is empty
+    (!isChangedFile || (fileDiff !== undefined && !fileDiff?.trim())) ? selectedFile : null
+  );
+  const fileViewLoading = diffLoading || contentLoading;
+  const fileError = diffError?.message ?? contentError?.message ?? null;
+
   const filteredWorkspaces = useMemo(() => {
     const query = filter.trim().toLowerCase();
     if (!query) return workspaces;
-    return workspaces.filter((ws) => {
-      return (
-        ws.name.toLowerCase().includes(query) ||
-        ws.repo.toLowerCase().includes(query) ||
-        ws.branch.toLowerCase().includes(query)
-      );
-    });
+    return workspaces.filter((ws) =>
+      ws.name.toLowerCase().includes(query) ||
+      ws.repo.toLowerCase().includes(query) ||
+      ws.branch.toLowerCase().includes(query)
+    );
   }, [filter, workspaces]);
 
   const workspacesByRepo = useMemo(() => {
     const map = new Map<string, Workspace[]>();
     for (const ws of filteredWorkspaces) {
       const list = map.get(ws.repo_id);
-      if (list) {
-        list.push(ws);
-      } else {
-        map.set(ws.repo_id, [ws]);
-      }
+      if (list) list.push(ws);
+      else map.set(ws.repo_id, [ws]);
     }
     return map;
   }, [filteredWorkspaces]);
@@ -1041,45 +1047,23 @@ function App() {
     const map = new Map<string, OpenGroup>();
     for (const ws of openWorkspaces) {
       const group = map.get(ws.repo_id);
-      if (group) {
-        group.workspaces.push(ws);
-      } else {
-        map.set(ws.repo_id, { repoId: ws.repo_id, repoName: ws.repo, workspaces: [ws] });
-      }
+      if (group) group.workspaces.push(ws);
+      else map.set(ws.repo_id, { repoId: ws.repo_id, repoName: ws.repo, workspaces: [ws] });
     }
-    const repoIds = new Set(repos.map((repo) => repo.id));
-    const ordered: OpenGroup[] = [];
-    for (const repo of repos) {
-      const group = map.get(repo.id);
-      if (group) ordered.push(group);
-    }
-    for (const group of map.values()) {
-      if (!repoIds.has(group.repoId)) {
-        ordered.push(group);
-      }
-    }
-    return ordered;
-  }, [openWorkspaces, repos]);
+    return Array.from(map.values());
+  }, [openWorkspaces]);
 
   const changesByPath = useMemo(() => {
     const map = new Map<string, WorkspaceChange>();
-    for (const change of changes) {
-      map.set(change.path, change);
-    }
+    for (const change of changes) map.set(change.path, change);
     return map;
   }, [changes]);
 
   const fileQuery = fileFilter.trim().toLowerCase();
-  const allFiles = useMemo(
-    () => files.filter((file) => !changesByPath.has(file)),
-    [files, changesByPath],
-  );
+  const allFiles = useMemo(() => files.filter((file) => !changesByPath.has(file)), [files, changesByPath]);
   const filteredChanges = useMemo(() => {
     if (!fileQuery) return changes;
-    return changes.filter((change) => {
-      if (change.path.toLowerCase().includes(fileQuery)) return true;
-      return change.old_path?.toLowerCase().includes(fileQuery) ?? false;
-    });
+    return changes.filter((c) => c.path.toLowerCase().includes(fileQuery) || c.old_path?.toLowerCase().includes(fileQuery));
   }, [changes, fileQuery]);
   const filteredAllFiles = useMemo(() => {
     if (!fileQuery) return allFiles;
@@ -1090,89 +1074,18 @@ function App() {
   const canPrev = activeIndex > 0;
   const canNext = activeIndex >= 0 && activeIndex < openWorkspaceIds.length - 1;
   const homeDirty = homeDraft.trim() !== home;
-  const chatEnabled = isDemo;
-  const chatStatus = isDemo ? "Local only" : "Not connected";
 
-  const provider = useMemo<DataProvider>(() => {
-    if (isDemo) {
-      return {
-        listRepos: async () => {
-          if (!demoLoaded) {
-            setDemoLoaded(true);
-            return demoRepos;
-          }
-          return repos;
-        },
-        listWorkspaces: async () => {
-          if (!demoLoaded) {
-            setDemoLoaded(true);
-            return demoWorkspaces;
-          }
-          return workspaces;
-        },
-        addRepoUrl: async (url: string) => {
-          const name = repoNameFromUrl(url);
-          const id = `demo-repo-${demoNextRepoId.current++}`;
-          return {
-            id,
-            name,
-            root_path: `~/conductor/repos/${name}`,
-            default_branch: "main",
-            remote_url: url,
-          };
-        },
-        createWorkspace: async (repoId: string, name?: string) => {
-          const repo = repos.find((item) => item.id === repoId) ?? demoRepos.find((item) => item.id === repoId);
-          const usedNames = new Set(workspaces.map((ws) => ws.name.toLowerCase()));
-          const picked = name?.trim() || pickDemoWorkspaceName(usedNames, demoNextId.current);
-          const id = `demo-ws-${demoNextId.current++}`;
-          const repoName = repo?.name ?? "repo";
-          const baseBranch = repo?.default_branch ?? "main";
-          return {
-            id,
-            repo_id: repoId,
-            repo: repoName,
-            name: picked,
-            branch: picked,
-            base_branch: baseBranch,
-            state: "ready",
-            path: `~/conductor/workspaces/${repoName}-demo/${picked}`,
-          };
-        },
-        workspaceFiles: async (workspaceId: string) => demoFilesByWorkspace[workspaceId] ?? demoFiles,
-        workspaceChanges: async (workspaceId: string) => demoChangesByWorkspace[workspaceId] ?? [],
-        workspaceFileDiff: async (_workspaceId: string, path: string) => demoDiffs[path] ?? "",
-        workspaceFileContent: async (_workspaceId: string, path: string) => demoFileContents[path] ?? "No preview available.",
-        resolveHome: async (path: string) => resolveDemoHome(path),
-      };
-    }
-    const args = home ? { home } : {};
-    return {
-      listRepos: async () => await safeInvoke<Repo[]>("list_repos", args),
-      listWorkspaces: async () => await safeInvoke<Workspace[]>("list_workspaces", { ...args, repo: null }),
-      addRepoUrl: async (url: string) => await safeInvoke<Repo>("add_repo_url", { ...args, url }),
-      createWorkspace: async (repoId: string, name?: string) =>
-        await safeInvoke<Workspace>("create_workspace", { ...args, repo: repoId, name: name || null }),
-      workspaceFiles: async (workspaceId: string) =>
-        await safeInvoke<string[]>("workspace_files", { ...args, workspace: workspaceId }),
-      workspaceChanges: async (workspaceId: string) =>
-        await safeInvoke<WorkspaceChange[]>("workspace_changes", { ...args, workspace: workspaceId }),
-      workspaceFileDiff: async (workspaceId: string, path: string) =>
-        await safeInvoke<string>("workspace_file_diff", { ...args, workspace: workspaceId, path }),
-      workspaceFileContent: async (workspaceId: string, path: string) =>
-        await safeInvoke<string>("workspace_file_content", { ...args, workspace: workspaceId, path }),
-      resolveHome: async (path: string) =>
-        await safeInvoke<string>("resolve_home_path", path ? { home: path } : {}),
-    };
-  }, [isDemo, demoLoaded, home, repos, workspaces]);
+  // API helpers (only resolveHome still needed directly)
+  const resolveHomeApi = useCallback((path: string) =>
+    safeInvoke<string>("resolve_home_path", path ? { home: path } : {}), []);
 
+  // Actions
   async function updateHomeResolved(nextHome: string) {
     try {
-      const resolved = await provider.resolveHome(nextHome);
+      const resolved = await resolveHomeApi(nextHome);
       setHomeResolved(resolved);
     } catch {
-      const fallback = nextHome.trim();
-      setHomeResolved(fallback);
+      setHomeResolved(nextHome.trim());
     }
   }
 
@@ -1183,63 +1096,40 @@ function App() {
     storeHome(nextHome);
   }
 
-  const refresh = useCallback(async () => {
-    setError(null);
-    setLoading(true);
-    try {
-      const [nextRepos, nextWorkspaces] = await Promise.all([
-        provider.listRepos(),
-        provider.listWorkspaces(),
-      ]);
-      setRepos(nextRepos);
-      setWorkspaces(nextWorkspaces);
-      return;
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      setError(message);
-    } finally {
-      setLoading(false);
+  // Refresh all data (invalidate queries)
+  const refresh = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: queryKeys.repos(home || undefined) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.workspaces(home || undefined) });
+  }, [queryClient, home]);
+
+  // Invalidate workspace files (for after agent changes)
+  const invalidateWorkspaceFiles = useCallback(() => {
+    if (activeWorkspaceId) {
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaceFiles(home || undefined, activeWorkspaceId) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.workspaceChanges(home || undefined, activeWorkspaceId) });
     }
-  }, [provider]);
+  }, [queryClient, home, activeWorkspaceId]);
 
   async function addRepo() {
     const url = repoUrl.trim();
-    if (!url) {
-      setRepoError("Enter a repo URL.");
-      return;
-    }
-    setRepoError(null);
-    setRepoAdding(true);
+    if (!url) return;
+    addRepoMutation.reset();
     try {
-      const repo = await provider.addRepoUrl(url);
+      await addRepoMutation.mutateAsync(url);
       setRepoUrl("");
-      setCreateRepoId(repo.id);
-      setRepos((prev) => [repo, ...prev]);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      setRepoError(message);
-    } finally {
-      setRepoAdding(false);
+    } catch {
+      // Error is handled by mutation state
     }
   }
 
-  async function createWorkspace() {
-    if (!createRepoId) {
-      setCreateError("Pick a repo before creating a workspace.");
-      return;
-    }
-    setCreateError(null);
-    setCreating(true);
+  async function createWorkspaceForRepo(repoId: string) {
+    if (!repoId) return;
+    createWorkspaceMutation.reset();
     try {
-      const created = await provider.createWorkspace(createRepoId, createName.trim() || undefined);
-      setWorkspaces((prev) => [created, ...prev]);
-      setCreateName("");
+      const created = await createWorkspaceMutation.mutateAsync({ repoId });
       openWorkspace(created.id);
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      setCreateError(message);
-    } finally {
-      setCreating(false);
+    } catch {
+      // Error is handled by mutation state
     }
   }
 
@@ -1255,8 +1145,7 @@ function App() {
       setActiveWorkspaceId((cur) => {
         if (cur !== id) return cur;
         if (!next.length) return null;
-        const nextIdx = Math.min(idx, next.length - 1);
-        return next[nextIdx];
+        return next[Math.min(idx, next.length - 1)];
       });
       return next;
     });
@@ -1271,299 +1160,447 @@ function App() {
   function toggleRepo(repoId: string) {
     setCollapsedRepoIds((prev) => {
       const next = new Set(prev);
-      if (next.has(repoId)) {
-        next.delete(repoId);
-      } else {
-        next.add(repoId);
+      if (next.has(repoId)) next.delete(repoId);
+      else next.add(repoId);
+      return next;
+    });
+  }
+
+  function createNewTab(agentId: string = "claude-code"): AgentTab {
+    const id = `tab-${tabIdCounter.current++}`;
+    return { id, agentId, name: AGENTS.find((a) => a.id === agentId)?.name ?? "Agent", messages: [], actions: new Map() };
+  }
+
+  function updateTabMessages(tabId: string, messages: ChatMessage[], updates?: Partial<AgentTab>) {
+    setAgentTabs((prev) => {
+      const next = prev.map((t) => t.id === tabId ? { ...t, messages, ...updates } : t);
+      if (activeWorkspaceId) tabStore.current.set(activeWorkspaceId, next);
+      return next;
+    });
+  }
+
+  function addAgentTab() {
+    if (!activeWorkspaceId) return;
+    const newTab = createNewTab();
+    setAgentTabs((prev) => {
+      const next = [...prev, newTab];
+      tabStore.current.set(activeWorkspaceId, next);
+      return next;
+    });
+    setActiveTabId(newTab.id);
+  }
+
+  function closeAgentTab(tabId: string) {
+    setAgentTabs((prev) => {
+      const idx = prev.findIndex((t) => t.id === tabId);
+      const next = prev.filter((t) => t.id !== tabId);
+      if (activeWorkspaceId) tabStore.current.set(activeWorkspaceId, next);
+      if (activeTabId === tabId && next.length > 0) {
+        setActiveTabId(next[Math.min(idx, next.length - 1)].id);
+      } else if (next.length === 0) {
+        setActiveTabId(null);
       }
       return next;
     });
   }
 
-  function updateChatMessages(next: ChatMessage[]) {
-    setChatMessages(next);
-    if (activeWorkspaceId) {
-      chatStore.current.set(activeWorkspaceId, next);
-    }
+  function changeTabAgent(agentId: string) {
+    if (!activeTabId) return;
+    setAgentTabs((prev) => {
+      const next = prev.map((t) => t.id === activeTabId ? { ...t, agentId } : t);
+      if (activeWorkspaceId) tabStore.current.set(activeWorkspaceId, next);
+      return next;
+    });
   }
 
-  function sendChat() {
-    const trimmed = chatDraft.trim();
-    if (!trimmed || !activeWorkspaceId || !chatEnabled) return;
-    const userMsg: ChatMessage = {
-      id: `msg-${Date.now()}`,
-      role: "user",
-      content: trimmed,
-      meta: "you",
-    };
-    if (isDemo) {
-      const reply: ChatMessage = {
-        id: `msg-${Date.now()}-assistant`,
-        role: "assistant",
-        content: "Queued. I will summarize the changes next.",
-        meta: "assistant",
-      };
-      updateChatMessages([...chatMessages, userMsg, reply]);
-    } else {
-      updateChatMessages([...chatMessages, userMsg]);
-    }
-    setChatDraft("");
-  }
+  async function sendChat(messageOverride?: string) {
+    const currentTab = agentTabs.find((t) => t.id === activeTabId);
+    const trimmed = (messageOverride ?? chatDraft).trim();
+    if (!trimmed || !activeWorkspaceId || !activeTabId || !currentTab || !activeWorkspace) return;
 
-  useEffect(() => {
-    if (lastRefreshHome.current === home) {
+    // If running, queue the message for later
+    if (running) {
+      const queuedMsg: ChatMessage = { id: `msg-${Date.now()}-queued`, role: "user", content: trimmed, meta: "queued" };
+      updateTabMessages(activeTabId, [...currentTab.messages, queuedMsg]);
+      setQueuedMessage(trimmed);
+      setChatDraft("");
       return;
     }
-    lastRefreshHome.current = home;
-    void refresh();
-  }, [home, refresh]);
 
-  useEffect(() => {
-    void updateHomeResolved(home);
-  }, [home, provider]);
+    const userMsg: ChatMessage = { id: `msg-${Date.now()}`, role: "user", content: trimmed, meta: "you" };
+    updateTabMessages(activeTabId, [...currentTab.messages, userMsg], { running: true, startTime: Date.now() });
+    setChatDraft("");
 
-  useEffect(() => {
-    if (!isDemo || demoSeeded) return;
-    if (workspaces.length && openWorkspaceIds.length === 0) {
-      const ids = workspaces.slice(0, 2).map((ws) => ws.id);
-      setOpenWorkspaceIds(ids);
-      setActiveWorkspaceId(ids[0] ?? null);
-      setDemoSeeded(true);
+    // Persist user message to chat.md
+    if (activeWorkspace?.path) {
+      appendChatMutation.mutate({ wsPath: activeWorkspace.path, role: "User", content: trimmed });
     }
-  }, [isDemo, demoSeeded, workspaces, openWorkspaceIds.length]);
 
-  useEffect(() => {
-    if (!createRepoId && repos.length) {
-      setCreateRepoId(repos[0].id);
+    const sessionId = `${activeWorkspaceId}-${activeTabId}-${Date.now()}`;
+    agentSessionRef.current = { wsId: activeWorkspaceId, tabId: activeTabId, sessionId };
+
+    try {
+      await invoke("run_agent", {
+        engine: currentTab.agentId,
+        prompt: trimmed,
+        cwd: activeWorkspace.path,
+        sessionId,
+        resumeId: currentTab.resumeId ?? null, // Pass resume ID for session continuity
+      });
+    } catch (e) {
+      const errorMsg: ChatMessage = {
+        id: `msg-${Date.now()}-error`,
+        role: "system",
+        content: `Error: ${e instanceof Error ? e.message : String(e)}`,
+        meta: "error",
+      };
+      setAgentTabs((prev) => {
+        const tab = prev.find((t) => t.id === activeTabId);
+        if (!tab) return prev;
+        const next = prev.map((t) => t.id === activeTabId ? { ...t, messages: [...t.messages, errorMsg], running: false } : t);
+        if (activeWorkspaceId) tabStore.current.set(activeWorkspaceId, next);
+        return next;
+      });
     }
-  }, [createRepoId, repos]);
+  }
 
+  async function stopAgent() {
+    const session = agentSessionRef.current;
+    if (!session) return;
+    try {
+      await invoke("stop_agent", { sessionId: session.sessionId });
+    } catch (e) {
+      console.error("Failed to stop agent:", e);
+    }
+  }
+
+  // Process pending send message (from queue) after sendChat is defined
+  useEffect(() => {
+    if (pendingSendMessage) {
+      const msg = pendingSendMessage;
+      setPendingSendMessage(null);
+      // Small delay to ensure UI has settled
+      setTimeout(() => void sendChat(msg), 100);
+    }
+  }, [pendingSendMessage]);
+
+  // Effects - TanStack Query handles data fetching, these are for UI sync
+  useEffect(() => { void updateHomeResolved(home); }, [home]);
+
+  // Sync open workspace IDs with available workspaces
   useEffect(() => {
     const ids = new Set(workspaces.map((ws) => ws.id));
     const filtered = openWorkspaceIds.filter((id) => ids.has(id));
-    if (filtered.length !== openWorkspaceIds.length) {
-      setOpenWorkspaceIds(filtered);
-    }
+    if (filtered.length !== openWorkspaceIds.length) setOpenWorkspaceIds(filtered);
     if (activeWorkspaceId && !ids.has(activeWorkspaceId)) {
       setActiveWorkspaceId(filtered.length ? filtered[0] : null);
     }
   }, [workspaces, openWorkspaceIds, activeWorkspaceId]);
 
+  // Clear selected file when workspace changes
   useEffect(() => {
-    const req = ++filesReq.current;
-    if (!activeWorkspace) {
-      setFiles([]);
-      setChanges([]);
-      setSelectedFile(null);
-      setFileContent(null);
-      setFileDiff(null);
-      setFileError(null);
-      setFilesLoading(false);
-      return;
-    }
-    setFilesLoading(true);
-    setFileError(null);
-    void (async () => {
-      try {
-        const [nextFiles, nextChanges] = await Promise.all([
-          provider.workspaceFiles(activeWorkspace.id),
-          provider.workspaceChanges(activeWorkspace.id),
-        ]);
-        if (filesReq.current !== req) {
-          return;
-        }
-        setFiles(nextFiles);
-        setChanges(nextChanges);
-        setSelectedFile(nextChanges[0]?.path ?? nextFiles[0] ?? null);
-      } catch (e) {
-        if (filesReq.current !== req) {
-          return;
-        }
-        const message = e instanceof Error ? e.message : String(e);
-        setFileError(message);
-        setFiles([]);
-        setChanges([]);
-        setSelectedFile(null);
-      } finally {
-        if (filesReq.current === req) {
-          setFilesLoading(false);
-        }
-      }
-    })();
-  }, [activeWorkspace, provider]);
+    setSelectedFile(null);
+  }, [activeWorkspaceId]);
 
   useEffect(() => {
-    const req = ++previewReq.current;
-    if (!activeWorkspace || !selectedFile) {
-      setFileContent(null);
-      setFileDiff(null);
-      setFileViewLoading(false);
-      return;
+    if (!activeWorkspaceId) { setAgentTabs([]); setActiveTabId(null); return; }
+    const stored = tabStore.current.get(activeWorkspaceId);
+    if (stored && stored.length > 0) { setAgentTabs(stored); setActiveTabId(stored[0].id); return; }
+    // Create new tab with saved resumeId and restored chat history
+    const initialTab = createNewTab();
+    if (sessionState?.resume_id) {
+      initialTab.resumeId = sessionState.resume_id;
     }
-    setFileViewLoading(true);
-    setFileError(null);
-    const change = changesByPath.get(selectedFile);
-    void (async () => {
-      try {
-        if (change) {
-          const patch = await provider.workspaceFileDiff(activeWorkspace.id, selectedFile);
-          if (previewReq.current !== req) {
-            return;
-          }
-          if (patch.trim()) {
-            setFileDiff(patch);
-            setFileContent(null);
-          } else {
-            const content = await provider.workspaceFileContent(activeWorkspace.id, selectedFile);
-            if (previewReq.current !== req) {
-              return;
-            }
-            setFileDiff(null);
-            setFileContent(content);
-          }
-        } else {
-          const content = await provider.workspaceFileContent(activeWorkspace.id, selectedFile);
-          if (previewReq.current !== req) {
-            return;
-          }
-          setFileDiff(null);
-          setFileContent(content);
-        }
-      } catch (e) {
-        if (previewReq.current !== req) {
-          return;
-        }
-        const message = e instanceof Error ? e.message : String(e);
-        setFileError(message);
-        setFileContent(null);
-        setFileDiff(null);
-      } finally {
-        if (previewReq.current === req) {
-          setFileViewLoading(false);
-        }
+    // Restore chat history from chat.md if available
+    if (chatHistory) {
+      const restoredMessages = parseChatMd(chatHistory);
+      if (restoredMessages.length > 0) {
+        initialTab.messages = restoredMessages;
       }
-    })();
-  }, [activeWorkspace, changesByPath, provider, selectedFile]);
-
-  useEffect(() => {
-    if (!activeWorkspaceId) {
-      setChatMessages([]);
-      return;
     }
-    const stored = chatStore.current.get(activeWorkspaceId);
-    if (stored) {
-      setChatMessages(stored);
-      return;
-    }
-    const seed = isDemo
-      ? demoMessages[activeWorkspaceId] ?? demoMessages.default
-      : [];
-    chatStore.current.set(activeWorkspaceId, seed);
-    setChatMessages(seed);
-  }, [activeWorkspaceId, isDemo]);
+    tabStore.current.set(activeWorkspaceId, [initialTab]);
+    setAgentTabs([initialTab]);
+    setActiveTabId(initialTab.id);
+  }, [activeWorkspaceId, sessionState, chatHistory]);
 
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [chatMessages, activeWorkspaceId]);
+  }, [agentTabs, activeTabId]);
+
+  // Ref to store the latest invalidation function (avoids stale closures in event listener)
+  const invalidateFilesRef = useRef(invalidateWorkspaceFiles);
+  useEffect(() => { invalidateFilesRef.current = invalidateWorkspaceFiles; }, [invalidateWorkspaceFiles]);
+
+  // Listen for agent events
+  useEffect(() => {
+    let unlisten: UnlistenFn | null = null;
+
+    const setupListener = async () => {
+      // Listen for agent events (fixed event name, session_id in payload)
+      unlisten = await listen<AgentEvent & { session_id?: string }>("agent_event", (event) => {
+        const agentEvent = event.payload;
+        const session = agentSessionRef.current;
+        if (!session) return;
+
+        // Check session_id matches
+        if (agentEvent.session_id !== session.sessionId) return;
+
+        // Trigger file refresh on file_change completion or session end (debounced via setTimeout)
+        if (agentEvent.type === "agent.action" && agentEvent.action?.kind === "file_change" && agentEvent.phase === "completed") {
+          setTimeout(() => invalidateFilesRef.current(), 500);
+        }
+        // Also refresh when agent session ends (catches any missed changes)
+        if (agentEvent.type === "agent.completed" || agentEvent.type === "session_ended" || agentEvent.type === "session_stopped") {
+          setTimeout(() => invalidateFilesRef.current(), 500);
+        }
+        // Play notification sound only on final session end (not agent.completed which may come first)
+        if (agentEvent.type === "session_ended") {
+          playNotificationSound();
+        }
+
+        setAgentTabs((prev) => {
+          const tab = prev.find((t) => t.id === session.tabId);
+          if (!tab) return prev;
+
+          let newMsg: ChatMessage | null = null;
+          let updates: Partial<AgentTab> = {};
+          let updatedActions: Map<string, ActionState> | null = null;
+          let updateExistingAction: { actionId: string; phase: string; ok?: boolean } | null = null;
+
+          if (agentEvent.type === "agent.message" && agentEvent.text) {
+            // Update existing assistant message or create new one (handles streaming updates)
+            const existingMsgIdx = tab.messages.findIndex((m) => m.role === "assistant" && m.id.startsWith("msg-stream-"));
+            if (existingMsgIdx >= 0) {
+              // Update existing streaming message in place
+              const existingMsg = tab.messages[existingMsgIdx];
+              if (existingMsg.content !== agentEvent.text) {
+                const updatedMsgs = [...tab.messages];
+                updatedMsgs[existingMsgIdx] = { ...existingMsg, content: agentEvent.text };
+                const next = prev.map((t) => t.id === session.tabId ? { ...t, messages: updatedMsgs } : t);
+                tabStore.current.set(session.wsId, next);
+                return next;
+              }
+              return prev; // No change
+            }
+            // Create new streaming message
+            newMsg = { id: `msg-stream-${Date.now()}`, role: "assistant", content: agentEvent.text, meta: agentEvent.engine ?? "agent" };
+          } else if (agentEvent.type === "agent.action" && agentEvent.action) {
+            const { action, phase, ok } = agentEvent;
+            const phaseTyped = (phase ?? "started") as "started" | "updated" | "completed";
+            const existing = tab.actions.get(action.id);
+
+            // Track action state
+            updatedActions = new Map(tab.actions);
+            updatedActions.set(action.id, {
+              id: action.id,
+              kind: action.kind,
+              title: action.title,
+              phase: phaseTyped,
+              ok,
+              firstSeen: existing?.firstSeen ?? Date.now(),
+            });
+
+            if (existing) {
+              // Update existing action message
+              updateExistingAction = { actionId: action.id, phase: phaseTyped, ok };
+            } else {
+              // Create new action message
+              newMsg = {
+                id: `msg-action-${action.id}`,
+                role: "action", content: action.title, meta: action.kind,
+                actionKind: action.kind, actionPhase: phaseTyped, actionId: action.id,
+                actionDetail: action.detail, ok,
+              };
+            }
+          } else if (agentEvent.type === "agent.completed" || agentEvent.type === "session_ended" || agentEvent.type === "session_stopped") {
+            updates.running = false;
+            // Clear actions on completion
+            updatedActions = new Map();
+            // Add stopped message if manually stopped
+            if (agentEvent.type === "session_stopped") {
+              newMsg = { id: `msg-${Date.now()}-stopped`, role: "system", content: "Agent stopped", meta: "stopped" };
+            }
+            // Finalize streaming message so next session won't update it
+            const streamMsgIdx = tab.messages.findIndex((m) => m.id.startsWith("msg-stream-"));
+            if (streamMsgIdx >= 0) {
+              const updatedMsgs = [...tab.messages];
+              const streamMsg = updatedMsgs[streamMsgIdx];
+              updatedMsgs[streamMsgIdx] = { ...streamMsg, id: `msg-final-${Date.now()}` };
+              // Persist assistant message to chat.md
+              const ws = workspaceById.get(session.wsId);
+              if (ws?.path && streamMsg.content) {
+                appendChatMutation.mutate({ wsPath: ws.path, role: "Assistant", content: streamMsg.content });
+              }
+              const next = prev.map((t) => t.id === session.tabId ? { ...t, messages: updatedMsgs, actions: new Map(), running: false } : t);
+              tabStore.current.set(session.wsId, next);
+              return next;
+            }
+            // Only add error messages
+            if (agentEvent.type === "agent.completed" && agentEvent.error) {
+              newMsg = { id: `msg-${Date.now()}-error`, role: "system", content: agentEvent.error, meta: "error" };
+            }
+          } else if (agentEvent.type === "agent.started" || agentEvent.type === "session_started") {
+            // Clear previous actions on new session (don't show a message)
+            updatedActions = new Map();
+            // Capture resume token for session continuity (Takopi pattern)
+            if (agentEvent.resume) {
+              updates.resumeId = agentEvent.resume;
+              // Persist resume ID to .conductor-app/session.json (upsert creates if missing)
+              const ws = workspaceById.get(session.wsId);
+              if (ws?.path) {
+                upsertResumeIdMutation.mutate({ wsPath: ws.path, agentId: tab.agentId, resumeId: agentEvent.resume });
+              }
+            }
+          }
+
+          // Build updated messages
+          let nextMsgs = tab.messages;
+          if (updateExistingAction) {
+            // Update existing action message in place
+            nextMsgs = tab.messages.map((m) =>
+              m.actionId === updateExistingAction!.actionId
+                ? { ...m, actionPhase: updateExistingAction!.phase, ok: updateExistingAction!.ok }
+                : m
+            );
+          } else if (newMsg) {
+            nextMsgs = [...tab.messages, newMsg];
+          }
+
+          const nextTab = {
+            ...tab,
+            messages: nextMsgs,
+            ...(updatedActions ? { actions: updatedActions } : {}),
+            ...updates,
+          };
+          const next = prev.map((t) => t.id === session.tabId ? nextTab : t);
+          tabStore.current.set(session.wsId, next);
+          return next;
+        });
+      });
+    };
+
+    setupListener();
+    return () => { if (unlisten) unlisten(); };
+  }, []);
+
+  const handleSidebarResize = useCallback((delta: number) => {
+    setSidebarWidth((prev) => Math.max(180, Math.min(400, prev + delta)));
+  }, []);
+
+  const handleFilesResize = useCallback((delta: number) => {
+    setFilesWidth((prev) => Math.max(240, Math.min(500, prev + delta)));
+  }, []);
 
   return (
-    <div className="app">
-      <Rail
-        isDemo={isDemo}
-        repos={repos}
-        workspaces={workspaces}
-        openWorkspaceIds={openWorkspaceIds}
-        activeWorkspaceId={activeWorkspaceId}
-        loading={loading}
-        repoAdding={repoAdding}
-        homeDraft={homeDraft}
-        homeResolved={homeResolved}
-        homeDirty={homeDirty}
-        filter={filter}
-        createRepoId={createRepoId}
-        createName={createName}
-        creating={creating}
-        createError={createError}
-        repoUrl={repoUrl}
-        repoError={repoError}
-        collapsedRepoIds={collapsedRepoIds}
-        workspacesByRepo={workspacesByRepo}
-        openWorkspaces={openWorkspaces}
-        filteredWorkspaces={filteredWorkspaces}
-        onHomeDraftChange={(value) => setHomeDraft(value)}
-        onApplyHome={applyHome}
-        onRefresh={() => void refresh()}
-        onFilterChange={(value) => setFilter(value)}
-        onCreateRepoChange={(value) => setCreateRepoId(value)}
-        onCreateNameChange={(value) => setCreateName(value)}
-        onCreateWorkspace={() => void createWorkspace()}
-        onRepoUrlChange={(value) => {
-          setRepoUrl(value);
-          setRepoError(null);
-        }}
-        onAddRepo={() => void addRepo()}
-        onToggleRepo={toggleRepo}
-        onOpenWorkspace={openWorkspace}
-      />
+    <div className="app" style={{ gridTemplateColumns: sidebarCollapsed ? `0 0 1fr` : `${sidebarWidth}px auto 1fr` }}>
+      {!sidebarCollapsed && (
+        <Rail
+          repos={repos} workspaces={workspaces} openWorkspaceIds={openWorkspaceIds}
+          activeWorkspaceId={activeWorkspaceId} loading={loading} repoAdding={repoAdding}
+          homeDraft={homeDraft} homeResolved={homeResolved} homeDirty={homeDirty}
+          filter={filter} creating={creating} createError={createError}
+          repoUrl={repoUrl} repoError={repoError} collapsedRepoIds={collapsedRepoIds}
+          workspacesByRepo={workspacesByRepo} filteredWorkspaces={filteredWorkspaces}
+          repoUrlInputRef={repoUrlInputRef} showHomePopover={showHomePopover}
+          onHomeDraftChange={setHomeDraft} onApplyHome={applyHome} onRefresh={() => void refresh()}
+          onFilterChange={setFilter} onCreateWorkspaceForRepo={(id) => void createWorkspaceForRepo(id)}
+          onRepoUrlChange={(v) => { setRepoUrl(v); addRepoMutation.reset(); }}
+          onAddRepo={() => void addRepo()} onToggleRepo={toggleRepo} onOpenWorkspace={openWorkspace}
+          onToggleHomePopover={() => setShowHomePopover(p => !p)}
+        />
+      )}
+      {!sidebarCollapsed && <ResizeHandle onResize={handleSidebarResize} direction="right" />}
 
       <main className="content">
         {error && (
           <div className="error-banner">
             <div className="error-title">Backend error</div>
             <div className="error-body">{error}</div>
-            <div className="error-hint">
-              Ensure the Conductor home directory is writable and `git` is available. Tauri on Linux also requires
-              WebKit/GTK prerequisites.
-            </div>
           </div>
         )}
 
         <TabsHeader
-          openGroups={openGroups}
-          activeWorkspaceId={activeWorkspaceId}
-          canPrev={canPrev}
-          canNext={canNext}
-          onActivate={(id) => setActiveWorkspaceId(id)}
-          onClose={closeWorkspace}
-          onPrev={() => activateOffset(-1)}
-          onNext={() => activateOffset(1)}
+          openGroups={openGroups} activeWorkspaceId={activeWorkspaceId}
+          canPrev={canPrev} canNext={canNext}
+          onActivate={setActiveWorkspaceId} onClose={closeWorkspace}
+          onPrev={() => activateOffset(-1)} onNext={() => activateOffset(1)}
         />
 
-        <section className="workspace-view">
-          <div className="workspace-panel">
-            <WorkspacePanel activeWorkspace={activeWorkspace} />
-            <ChatPanel
-              activeWorkspace={activeWorkspace}
-              chatEnabled={chatEnabled}
-              chatStatus={chatStatus}
-              chatMessages={chatMessages}
-              chatDraft={chatDraft}
-              onDraftChange={(value) => setChatDraft(value)}
-              onSend={sendChat}
-              chatEndRef={chatEndRef}
-            />
-          </div>
-
-          <FilesPanel
-            activeWorkspace={activeWorkspace}
-            files={files}
-            changes={changes}
-            filteredChanges={filteredChanges}
-            filteredAllFiles={filteredAllFiles}
-            filesLoading={filesLoading}
-            fileFilter={fileFilter}
-            showAllFiles={showAllFiles}
-            selectedFile={selectedFile}
-            fileError={fileError}
-            fileDiff={fileDiff}
-            fileContent={fileContent}
-            fileViewLoading={fileViewLoading}
-            onFileFilterChange={(value) => setFileFilter(value)}
-            onToggleShowAll={() => setShowAllFiles((prev) => !prev)}
-            onSelectFile={(path) => setSelectedFile(path)}
+        {openWorkspaceIds.length === 0 ? (
+          <WelcomeHero
+            hasRepos={repos.length > 0}
+            onAddRepoFocus={() => {
+              if (sidebarCollapsed) setSidebarCollapsed(false);
+              setTimeout(() => repoUrlInputRef.current?.focus(), 100);
+            }}
           />
-        </section>
+        ) : (
+          <section className="workspace-view" style={{ gridTemplateColumns: filesCollapsed ? "1fr 0 0" : `1fr auto ${filesWidth}px` }}>
+            <div className="workspace-panel">
+              <WorkspacePanel activeWorkspace={activeWorkspace} />
+              <ChatPanel
+                activeWorkspace={activeWorkspace} tabs={agentTabs} activeTabId={activeTabId}
+                chatDraft={chatDraft} running={running} startTime={activeTab?.startTime} files={files}
+                onTabChange={setActiveTabId} onTabClose={closeAgentTab} onTabAdd={addAgentTab}
+                onAgentChange={changeTabAgent} onDraftChange={setChatDraft}
+                onSend={() => void sendChat()} onStop={() => void stopAgent()}
+                chatEndRef={chatEndRef}
+              />
+              {/* Terminal toggle and panel */}
+              <button className="terminal-toggle" onClick={() => setTerminalOpen((p) => !p)}>
+                <span>{terminalOpen ? "▼" : "▲"}</span>
+                <span>Terminal</span>
+              </button>
+              {terminalOpen && activeWorkspace && activeTabId && (
+                <div className="terminal-panel">
+                  <div className="terminal-header">
+                    <span className="terminal-title">Terminal</span>
+                    <div className="terminal-actions">
+                      <button className="terminal-btn" onClick={() => setTerminalOpen(false)}>×</button>
+                    </div>
+                  </div>
+                  <Terminal
+                    workspacePath={activeWorkspace.path}
+                    sessionId={activeTabId}
+                  />
+                </div>
+              )}
+            </div>
+
+            {!filesCollapsed && <ResizeHandle onResize={handleFilesResize} direction="left" />}
+            {!filesCollapsed && (
+              <FilesPanel
+                activeWorkspace={activeWorkspace} files={files} changes={changes}
+                filteredChanges={filteredChanges} filteredAllFiles={filteredAllFiles}
+                filesLoading={filesLoading} fileFilter={fileFilter} showAllFiles={showAllFiles}
+                selectedFile={selectedFile} fileError={fileError} fileDiff={fileDiff ?? null}
+                fileContent={fileContent ?? null} fileViewLoading={fileViewLoading}
+                onFileFilterChange={setFileFilter} onToggleShowAll={() => setShowAllFiles((p) => !p)}
+                onSelectFile={setSelectedFile}
+              />
+            )}
+          </section>
+        )}
       </main>
+
+      <button className="collapse-toggle sidebar-toggle" onClick={() => setSidebarCollapsed((p) => !p)}
+        title={sidebarCollapsed ? "Show sidebar" : "Hide sidebar"}>
+        {sidebarCollapsed ? "→" : "←"}
+      </button>
+      <button className="collapse-toggle files-toggle" onClick={() => setFilesCollapsed((p) => !p)}
+        title={filesCollapsed ? "Show files" : "Hide files"}>
+        {filesCollapsed ? "←" : "→"}
+      </button>
+
+      <CommandPalette
+        open={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        repos={repos}
+        workspaces={workspaces}
+        onOpenWorkspace={openWorkspace}
+        onCreateWorkspace={(repoId) => void createWorkspaceForRepo(repoId)}
+        onRefresh={() => void refresh()}
+      />
     </div>
   );
 }
