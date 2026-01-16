@@ -1,0 +1,263 @@
+syntax = "proto3";
+
+package conductor;
+
+// Core service for Conductor daemon
+service Conductor {
+  // Repository management
+  rpc ListRepos(ListReposRequest) returns (ListReposResponse);
+  rpc AddRepo(AddRepoRequest) returns (Repo);
+  rpc AddRepoUrl(AddRepoUrlRequest) returns (Repo);
+
+  // Workspace management
+  rpc ListWorkspaces(ListWorkspacesRequest) returns (ListWorkspacesResponse);
+  rpc CreateWorkspace(CreateWorkspaceRequest) returns (Workspace);
+  rpc ArchiveWorkspace(ArchiveWorkspaceRequest) returns (ArchiveWorkspaceResponse);
+
+  // Workspace files
+  rpc GetWorkspaceFiles(GetWorkspaceFilesRequest) returns (GetWorkspaceFilesResponse);
+  rpc GetWorkspaceChanges(GetWorkspaceChangesRequest) returns (GetWorkspaceChangesResponse);
+  rpc GetFileContent(GetFileContentRequest) returns (GetFileContentResponse);
+  rpc GetFileDiff(GetFileDiffRequest) returns (GetFileDiffResponse);
+
+  // Session management
+  rpc GetSession(GetSessionRequest) returns (SessionState);
+  rpc CreateSession(CreateSessionRequest) returns (SessionState);
+  rpc SetResumeId(SetResumeIdRequest) returns (SessionState);
+
+  // Chat management
+  rpc GetChat(GetChatRequest) returns (GetChatResponse);
+  rpc AppendChat(AppendChatRequest) returns (AppendChatResponse);
+  rpc ClearChat(ClearChatRequest) returns (ClearChatResponse);
+
+  // Agent execution - the key streaming RPC
+  rpc RunAgent(RunAgentRequest) returns (stream AgentEvent);
+  rpc AttachAgent(AttachAgentRequest) returns (stream AgentEvent);
+  rpc StopAgent(StopAgentRequest) returns (StopAgentResponse);
+  rpc ListActiveAgents(ListActiveAgentsRequest) returns (ListActiveAgentsResponse);
+
+  // Daemon lifecycle
+  rpc Ping(PingRequest) returns (PingResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+}
+
+// ============ Repository Types ============
+
+message Repo {
+  string id = 1;
+  string name = 2;
+  string root_path = 3;
+  string default_branch = 4;
+  optional string remote_url = 5;
+}
+
+message ListReposRequest {}
+
+message ListReposResponse {
+  repeated Repo repos = 1;
+}
+
+message AddRepoRequest {
+  string path = 1;
+}
+
+message AddRepoUrlRequest {
+  string url = 1;
+  optional string parent_dir = 2;
+}
+
+// ============ Workspace Types ============
+
+message Workspace {
+  string id = 1;
+  string repository_id = 2;
+  string directory_name = 3;
+  string path = 4;
+  string branch = 5;
+  string base_branch = 6;
+  string state = 7;  // "ready", "archived", "error"
+}
+
+message ListWorkspacesRequest {
+  optional string repo_id = 1;
+}
+
+message ListWorkspacesResponse {
+  repeated Workspace workspaces = 1;
+}
+
+message CreateWorkspaceRequest {
+  string repo_id = 1;
+  optional string name = 2;
+}
+
+message ArchiveWorkspaceRequest {
+  string workspace_id = 1;
+  bool force = 2;
+}
+
+message ArchiveWorkspaceResponse {
+  bool success = 1;
+  optional string error = 2;
+}
+
+// ============ File Types ============
+
+message FileEntry {
+  string path = 1;
+  string status = 2;  // "tracked", "untracked", "modified", etc.
+}
+
+message GetWorkspaceFilesRequest {
+  string workspace_id = 1;
+}
+
+message GetWorkspaceFilesResponse {
+  repeated FileEntry files = 1;
+}
+
+message ChangedFile {
+  string path = 1;
+  string status = 2;
+  int32 insertions = 3;
+  int32 deletions = 4;
+}
+
+message GetWorkspaceChangesRequest {
+  string workspace_id = 1;
+}
+
+message GetWorkspaceChangesResponse {
+  repeated ChangedFile changes = 1;
+}
+
+message GetFileContentRequest {
+  string workspace_id = 1;
+  string file_path = 2;
+}
+
+message GetFileContentResponse {
+  string content = 1;
+}
+
+message GetFileDiffRequest {
+  string workspace_id = 1;
+  string file_path = 2;
+}
+
+message GetFileDiffResponse {
+  string diff = 1;
+}
+
+// ============ Session Types ============
+
+message SessionState {
+  optional string agent_id = 1;
+  optional string resume_id = 2;
+  optional string started_at = 3;
+  optional string updated_at = 4;
+}
+
+message GetSessionRequest {
+  string workspace_path = 1;
+}
+
+message CreateSessionRequest {
+  string workspace_path = 1;
+  string agent_id = 2;
+}
+
+message SetResumeIdRequest {
+  string workspace_path = 1;
+  string resume_id = 2;
+}
+
+// ============ Chat Types ============
+
+message ChatMessage {
+  string role = 1;
+  string content = 2;
+  string timestamp = 3;
+}
+
+message GetChatRequest {
+  string workspace_path = 1;
+}
+
+message GetChatResponse {
+  repeated ChatMessage messages = 1;
+}
+
+message AppendChatRequest {
+  string workspace_path = 1;
+  string role = 2;
+  string content = 3;
+}
+
+message AppendChatResponse {
+  bool success = 1;
+}
+
+message ClearChatRequest {
+  string workspace_path = 1;
+}
+
+message ClearChatResponse {
+  bool success = 1;
+}
+
+// ============ Agent Types ============
+
+message RunAgentRequest {
+  string engine = 1;        // "claude", "codex", "gemini"
+  string prompt = 2;
+  string cwd = 3;
+  string session_id = 4;
+  optional string resume_id = 5;
+}
+
+message AgentEvent {
+  string session_id = 1;
+  string event_type = 2;    // "started", "action", "message", "completed", "error"
+  string payload = 3;       // JSON payload for flexibility
+}
+
+message AttachAgentRequest {
+  string session_id = 1;
+}
+
+message StopAgentRequest {
+  string session_id = 1;
+}
+
+message StopAgentResponse {
+  bool success = 1;
+}
+
+message ActiveAgent {
+  string session_id = 1;
+  string engine = 2;
+  string cwd = 3;
+  string started_at = 4;
+}
+
+message ListActiveAgentsRequest {}
+
+message ListActiveAgentsResponse {
+  repeated ActiveAgent agents = 1;
+}
+
+// ============ Daemon Lifecycle ============
+
+message PingRequest {}
+
+message PingResponse {
+  string version = 1;
+  int64 uptime_secs = 2;
+}
+
+message ShutdownRequest {}
+
+message ShutdownResponse {
+  bool success = 1;
+}

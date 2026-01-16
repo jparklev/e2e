@@ -1,204 +1,432 @@
-use conductor_agent::AgentParser;
-use conductor_core::{self as core, ArchiveResult, Repo, SessionState, Workspace, WorkspaceChange};
+mod client;
+
+use conductor_core::{Repo, SessionState, Workspace, WorkspaceChange, ArchiveResult};
+use conductor_daemon::proto;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use tauri::Emitter;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio_stream::StreamExt;
 
 #[cfg(target_os = "macos")]
 use cocoa::base::{id, nil};
 #[cfg(target_os = "macos")]
 use objc::{class, msg_send, sel, sel_impl};
 
-// Global registry of running agent processes
-static AGENT_PROCESSES: LazyLock<Mutex<HashMap<String, Child>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-// Shell instance for PTY
+// Shell instance for PTY (kept local - not moved to daemon)
 struct ShellInstance {
     writer: Box<dyn Write + Send>,
     master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
-// Global registry of running shell processes
 static SHELL_PROCESSES: LazyLock<Mutex<HashMap<String, ShellInstance>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-
-fn expand_tilde(path: &str) -> PathBuf {
-    let trimmed = path.trim();
-    if trimmed == "~" || trimmed.starts_with("~/") {
-        if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
-            let mut expanded = PathBuf::from(home);
-            if trimmed.len() > 2 {
-                expanded.push(&trimmed[2..]);
-            }
-            return expanded;
-        }
-    }
-    PathBuf::from(trimmed)
-}
-
-fn resolve_home(home: Option<String>) -> Result<PathBuf, String> {
-    if let Some(home) = home {
-        if home.is_empty() {
-            return Ok(core::default_home());
-        }
-        let path = expand_tilde(&home);
-        if path.exists() && !path.is_dir() {
-            return Err("home must be a directory".to_string());
-        }
-        return Ok(path);
-    }
-    Ok(core::default_home())
-}
 
 fn map_err(err: impl std::fmt::Display) -> String {
     err.to_string()
 }
 
+// =============================================================================
+// Repository Commands (via daemon)
+// =============================================================================
+
 #[tauri::command]
-fn list_repos(home: Option<String>) -> Result<Vec<Repo>, String> {
-    let home = resolve_home(home)?;
-    let conn = core::connect(&home).map_err(map_err)?;
-    core::repo_list(&conn).map_err(map_err)
+async fn list_repos(_home: Option<String>) -> Result<Vec<Repo>, String> {
+    let mut client = client::get_client().await?;
+    let response = client
+        .list_repos(proto::ListReposRequest {})
+        .await
+        .map_err(map_err)?;
+
+    Ok(response
+        .into_inner()
+        .repos
+        .into_iter()
+        .map(|r| Repo {
+            id: r.id,
+            name: r.name,
+            root_path: r.root_path,
+            default_branch: r.default_branch,
+            remote_url: r.remote_url,
+        })
+        .collect())
 }
 
 #[tauri::command]
-fn add_repo(
-    home: Option<String>,
+async fn add_repo(
+    _home: Option<String>,
     path: String,
-    name: Option<String>,
-    default_branch: Option<String>,
+    _name: Option<String>,
+    _default_branch: Option<String>,
 ) -> Result<Repo, String> {
     if path.starts_with('-') {
         return Err("path must not start with '-'".to_string());
     }
-    let home = resolve_home(home)?;
-    let conn = core::connect(&home).map_err(map_err)?;
-    let path = PathBuf::from(path);
-    core::repo_add(&conn, &path, name.as_deref(), default_branch.as_deref()).map_err(map_err)
+
+    let mut client = client::get_client().await?;
+    let response = client
+        .add_repo(proto::AddRepoRequest { path })
+        .await
+        .map_err(map_err)?;
+
+    let r = response.into_inner();
+    Ok(Repo {
+        id: r.id,
+        name: r.name,
+        root_path: r.root_path,
+        default_branch: r.default_branch,
+        remote_url: r.remote_url,
+    })
 }
 
 #[tauri::command]
-fn add_repo_url(
-    home: Option<String>,
+async fn add_repo_url(
+    _home: Option<String>,
     url: String,
-    name: Option<String>,
-    default_branch: Option<String>,
+    _name: Option<String>,
+    _default_branch: Option<String>,
 ) -> Result<Repo, String> {
     if url.starts_with('-') {
         return Err("repo url must not start with '-'".to_string());
     }
-    let home = resolve_home(home)?;
-    let conn = core::connect(&home).map_err(map_err)?;
-    core::repo_add_url(
-        &conn,
-        &home,
-        &url,
-        name.as_deref(),
-        default_branch.as_deref(),
-    )
-    .map_err(map_err)
+
+    let mut client = client::get_client().await?;
+    let response = client
+        .add_repo_url(proto::AddRepoUrlRequest {
+            url,
+            parent_dir: None,
+        })
+        .await
+        .map_err(map_err)?;
+
+    let r = response.into_inner();
+    Ok(Repo {
+        id: r.id,
+        name: r.name,
+        root_path: r.root_path,
+        default_branch: r.default_branch,
+        remote_url: r.remote_url,
+    })
+}
+
+// =============================================================================
+// Workspace Commands (via daemon)
+// =============================================================================
+
+#[tauri::command]
+async fn list_workspaces(_home: Option<String>, repo: Option<String>) -> Result<Vec<Workspace>, String> {
+    let mut client = client::get_client().await?;
+    let response = client
+        .list_workspaces(proto::ListWorkspacesRequest { repo_id: repo })
+        .await
+        .map_err(map_err)?;
+
+    Ok(response
+        .into_inner()
+        .workspaces
+        .into_iter()
+        .map(|w| Workspace {
+            id: w.id,
+            repo_id: w.repository_id,
+            repo: String::new(), // Not returned by daemon
+            name: w.directory_name,
+            branch: w.branch,
+            base_branch: w.base_branch,
+            state: match w.state.as_str() {
+                "ready" => conductor_core::WorkspaceState::Ready,
+                "archived" => conductor_core::WorkspaceState::Archived,
+                "error" => conductor_core::WorkspaceState::Error,
+                _ => conductor_core::WorkspaceState::Ready,
+            },
+            path: w.path,
+        })
+        .collect())
 }
 
 #[tauri::command]
-fn list_workspaces(home: Option<String>, repo: Option<String>) -> Result<Vec<Workspace>, String> {
-    let home = resolve_home(home)?;
-    let conn = core::connect(&home).map_err(map_err)?;
-    core::workspace_list(&conn, repo.as_deref()).map_err(map_err)
-}
-
-#[tauri::command]
-fn create_workspace(
-    home: Option<String>,
+async fn create_workspace(
+    _home: Option<String>,
     repo: String,
     name: Option<String>,
-    base: Option<String>,
-    branch: Option<String>,
+    _base: Option<String>,
+    _branch: Option<String>,
 ) -> Result<Workspace, String> {
     if repo.starts_with('-') {
         return Err("repo must not start with '-'".to_string());
     }
-    let home = resolve_home(home)?;
-    let conn = core::connect(&home).map_err(map_err)?;
-    core::workspace_create(
-        &conn,
-        &home,
-        &repo,
-        name.as_deref(),
-        base.as_deref(),
-        branch.as_deref(),
-    )
-    .map_err(map_err)
+
+    let mut client = client::get_client().await?;
+    let response = client
+        .create_workspace(proto::CreateWorkspaceRequest {
+            repo_id: repo,
+            name,
+        })
+        .await
+        .map_err(map_err)?;
+
+    let w = response.into_inner();
+    Ok(Workspace {
+        id: w.id,
+        repo_id: w.repository_id,
+        repo: String::new(),
+        name: w.directory_name,
+        branch: w.branch,
+        base_branch: w.base_branch,
+        state: match w.state.as_str() {
+            "ready" => conductor_core::WorkspaceState::Ready,
+            "archived" => conductor_core::WorkspaceState::Archived,
+            "error" => conductor_core::WorkspaceState::Error,
+            _ => conductor_core::WorkspaceState::Ready,
+        },
+        path: w.path,
+    })
 }
 
 #[tauri::command]
-fn archive_workspace(home: Option<String>, workspace: String, force: Option<bool>) -> Result<ArchiveResult, String> {
+async fn archive_workspace(
+    _home: Option<String>,
+    workspace: String,
+    force: Option<bool>,
+) -> Result<ArchiveResult, String> {
     if workspace.starts_with('-') {
         return Err("workspace must not start with '-'".to_string());
     }
-    let home = resolve_home(home)?;
-    let conn = core::connect(&home).map_err(map_err)?;
-    core::workspace_archive(&conn, &home, &workspace, force.unwrap_or(false)).map_err(map_err)
-}
 
-#[tauri::command]
-fn workspace_files(home: Option<String>, workspace: String) -> Result<Vec<String>, String> {
-    let home = resolve_home(home)?;
-    let conn = core::connect(&home).map_err(map_err)?;
-    core::workspace_files(&conn, &workspace).map_err(map_err)
-}
+    let mut client = client::get_client().await?;
+    let workspace_id = workspace.clone();
+    let response = client
+        .archive_workspace(proto::ArchiveWorkspaceRequest {
+            workspace_id,
+            force: force.unwrap_or(false),
+        })
+        .await
+        .map_err(map_err)?;
 
-#[tauri::command]
-fn workspace_changes(home: Option<String>, workspace: String) -> Result<Vec<WorkspaceChange>, String> {
-    let home = resolve_home(home)?;
-    let conn = core::connect(&home).map_err(map_err)?;
-    core::workspace_changes(&conn, &workspace).map_err(map_err)
-}
-
-#[tauri::command]
-fn workspace_file_content(home: Option<String>, workspace: String, path: String) -> Result<String, String> {
-    let home = resolve_home(home)?;
-    let conn = core::connect(&home).map_err(map_err)?;
-    core::workspace_file_content(&conn, &workspace, &path).map_err(map_err)
-}
-
-#[tauri::command]
-fn workspace_file_diff(home: Option<String>, workspace: String, path: String) -> Result<String, String> {
-    let home = resolve_home(home)?;
-    let conn = core::connect(&home).map_err(map_err)?;
-    core::workspace_file_diff(&conn, &workspace, &path).map_err(map_err)
-}
-
-#[tauri::command]
-fn resolve_home_path(home: Option<String>) -> Result<String, String> {
-    let home = resolve_home(home)?;
-    Ok(home.to_string_lossy().to_string())
-}
-
-#[tauri::command]
-fn parse_agent_lines(lines: Vec<String>) -> Result<Vec<Value>, String> {
-    let mut parser = AgentParser::new();
-    let mut out = Vec::new();
-    for line in lines {
-        let value: Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        if let Some(events) = parser.parse_value(&value) {
-            out.extend(events);
-        }
+    let r = response.into_inner();
+    if r.success {
+        Ok(ArchiveResult {
+            id: workspace,
+            ok: true,
+            removed: true,
+            message: "archived".to_string(),
+        })
+    } else {
+        Err(r.error.unwrap_or_else(|| "Archive failed".to_string()))
     }
-    Ok(out)
 }
+
+#[tauri::command]
+async fn workspace_files(_home: Option<String>, workspace: String) -> Result<Vec<String>, String> {
+    let mut client = client::get_client().await?;
+    let response = client
+        .get_workspace_files(proto::GetWorkspaceFilesRequest {
+            workspace_id: workspace,
+        })
+        .await
+        .map_err(map_err)?;
+
+    Ok(response
+        .into_inner()
+        .files
+        .into_iter()
+        .map(|f| f.path)
+        .collect())
+}
+
+#[tauri::command]
+async fn workspace_changes(_home: Option<String>, workspace: String) -> Result<Vec<WorkspaceChange>, String> {
+    let mut client = client::get_client().await?;
+    let response = client
+        .get_workspace_changes(proto::GetWorkspaceChangesRequest {
+            workspace_id: workspace,
+        })
+        .await
+        .map_err(map_err)?;
+
+    Ok(response
+        .into_inner()
+        .changes
+        .into_iter()
+        .map(|c| WorkspaceChange {
+            old_path: None,
+            path: c.path,
+            status: c.status,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn workspace_file_content(
+    _home: Option<String>,
+    workspace: String,
+    path: String,
+) -> Result<String, String> {
+    let mut client = client::get_client().await?;
+    let response = client
+        .get_file_content(proto::GetFileContentRequest {
+            workspace_id: workspace,
+            file_path: path,
+        })
+        .await
+        .map_err(map_err)?;
+
+    Ok(response.into_inner().content)
+}
+
+#[tauri::command]
+async fn workspace_file_diff(
+    _home: Option<String>,
+    workspace: String,
+    path: String,
+) -> Result<String, String> {
+    let mut client = client::get_client().await?;
+    let response = client
+        .get_file_diff(proto::GetFileDiffRequest {
+            workspace_id: workspace,
+            file_path: path,
+        })
+        .await
+        .map_err(map_err)?;
+
+    Ok(response.into_inner().diff)
+}
+
+#[tauri::command]
+fn resolve_home_path(_home: Option<String>) -> Result<String, String> {
+    Ok(conductor_core::default_home().to_string_lossy().to_string())
+}
+
+// =============================================================================
+// Session & Chat Commands (via daemon)
+// =============================================================================
+
+#[tauri::command]
+async fn session_read(workspace_path: String) -> Result<Option<SessionState>, String> {
+    let mut client = client::get_client().await?;
+    let response = client
+        .get_session(proto::GetSessionRequest { workspace_path })
+        .await
+        .map_err(map_err)?;
+
+    let s = response.into_inner();
+    if s.agent_id.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(SessionState {
+        agent_id: s.agent_id.unwrap_or_default(),
+        resume_id: s.resume_id,
+        started_at: s.started_at.unwrap_or_default(),
+        updated_at: s.updated_at.unwrap_or_default(),
+    }))
+}
+
+#[tauri::command]
+async fn session_create(workspace_path: String, agent_id: String) -> Result<SessionState, String> {
+    let mut client = client::get_client().await?;
+    let response = client
+        .create_session(proto::CreateSessionRequest {
+            workspace_path,
+            agent_id,
+        })
+        .await
+        .map_err(map_err)?;
+
+    let s = response.into_inner();
+    Ok(SessionState {
+        agent_id: s.agent_id.unwrap_or_default(),
+        resume_id: s.resume_id,
+        started_at: s.started_at.unwrap_or_default(),
+        updated_at: s.updated_at.unwrap_or_default(),
+    })
+}
+
+#[tauri::command]
+async fn session_set_resume_id(workspace_path: String, resume_id: String) -> Result<SessionState, String> {
+    let mut client = client::get_client().await?;
+    let response = client
+        .set_resume_id(proto::SetResumeIdRequest {
+            workspace_path,
+            resume_id,
+        })
+        .await
+        .map_err(map_err)?;
+
+    let s = response.into_inner();
+    Ok(SessionState {
+        agent_id: s.agent_id.unwrap_or_default(),
+        resume_id: s.resume_id,
+        started_at: s.started_at.unwrap_or_default(),
+        updated_at: s.updated_at.unwrap_or_default(),
+    })
+}
+
+#[tauri::command]
+async fn session_upsert_resume_id(
+    workspace_path: String,
+    agent_id: String,
+    resume_id: String,
+) -> Result<SessionState, String> {
+    // Try to read existing session first
+    let existing = session_read(workspace_path.clone()).await?;
+
+    if existing.is_some() {
+        // Update existing
+        session_set_resume_id(workspace_path, resume_id).await
+    } else {
+        // Create new, then set resume_id
+        session_create(workspace_path.clone(), agent_id).await?;
+        session_set_resume_id(workspace_path, resume_id).await
+    }
+}
+
+#[tauri::command]
+async fn chat_read(workspace_path: String) -> Result<String, String> {
+    let mut client = client::get_client().await?;
+    let response = client
+        .get_chat(proto::GetChatRequest { workspace_path })
+        .await
+        .map_err(map_err)?;
+
+    // Return raw content from first message
+    Ok(response
+        .into_inner()
+        .messages
+        .first()
+        .map(|m| m.content.clone())
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+async fn chat_append(workspace_path: String, role: String, content: String) -> Result<(), String> {
+    let mut client = client::get_client().await?;
+    client
+        .append_chat(proto::AppendChatRequest {
+            workspace_path,
+            role,
+            content,
+        })
+        .await
+        .map_err(map_err)?;
+    Ok(())
+}
+
+#[tauri::command]
+async fn chat_clear(workspace_path: String) -> Result<(), String> {
+    let mut client = client::get_client().await?;
+    client
+        .clear_chat(proto::ClearChatRequest { workspace_path })
+        .await
+        .map_err(map_err)?;
+    Ok(())
+}
+
+// =============================================================================
+// Agent Commands (via daemon streaming)
+// =============================================================================
 
 #[tauri::command]
 async fn run_agent(
@@ -209,103 +437,98 @@ async fn run_agent(
     session_id: String,
     resume_id: Option<String>,
 ) -> Result<(), String> {
-    let (cmd, args) = match engine.as_str() {
-        "claude" | "claude-code" => {
-            let mut args = vec![
-                "-p".to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--dangerously-skip-permissions".to_string(), // YOLO mode
-            ];
-            // Add resume flag if we have a session to resume
-            if let Some(ref resume) = resume_id {
-                args.push("--resume".to_string());
-                args.push(resume.clone());
-            }
-            args.push("--".to_string());
-            args.push(prompt);
-            ("claude", args)
-        }
-        "codex" => (
-            "codex",
-            vec![
-                "--full-auto".to_string(), // YOLO mode - no permission prompts
-                prompt,
-            ],
-        ),
-        "gemini" => (
-            "gemini",
-            vec![
-                "-m".to_string(),
-                "gemini-3-pro-preview".to_string(),
-                "--yolo".to_string(), // YOLO mode for Gemini CLI
-                prompt,
-            ],
-        ),
-        _ => return Err(format!("Unknown engine: {engine}")),
-    };
+    let mut client = client::get_client().await?;
 
-    let mut child = Command::new(cmd)
-        .args(&args)
-        .current_dir(&cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to spawn {cmd}: {e}"))?;
+    // Start the agent stream
+    let response = client
+        .run_agent(proto::RunAgentRequest {
+            engine: engine.clone(),
+            prompt,
+            cwd,
+            session_id: session_id.clone(),
+            resume_id,
+        })
+        .await
+        .map_err(map_err)?;
 
-    let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
-    let mut reader = BufReader::new(stdout).lines();
-    let mut parser = AgentParser::new();
+    let mut stream = response.into_inner();
+    let app_clone = app.clone();
 
-    // Register the process so it can be stopped
-    {
-        let mut processes = AGENT_PROCESSES.lock().await;
-        processes.insert(session_id.clone(), child);
-    }
+    // Spawn task to forward events to UI
+    tokio::spawn(async move {
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(event) => {
+                    // Parse payload and emit to UI
+                    let payload: serde_json::Value = serde_json::from_str(&event.payload)
+                        .unwrap_or(serde_json::Value::Null);
 
-    // Emit session started event
-    let _ = app.emit("agent_event", serde_json::json!({
-        "type": "session_started",
-        "engine": engine,
-        "session_id": session_id,
-    }));
+                    let mut event_obj = serde_json::json!({
+                        "session_id": event.session_id,
+                        "type": event.event_type,
+                    });
 
-    // Read and parse JSON lines, emit events
-    while let Ok(Some(line)) = reader.next_line().await {
-        if let Ok(value) = serde_json::from_str::<Value>(&line) {
-            if let Some(events) = parser.parse_value(&value) {
-                for event in events {
-                    // Add session_id to each event
-                    if let Value::Object(mut obj) = event {
-                        obj.insert("session_id".to_string(), Value::String(session_id.clone()));
-                        let _ = app.emit("agent_event", Value::Object(obj));
+                    // Merge payload into event
+                    if let serde_json::Value::Object(map) = payload {
+                        if let serde_json::Value::Object(ref mut obj) = event_obj {
+                            obj.extend(map);
+                        }
                     }
+
+                    let _ = app_clone.emit("agent_event", event_obj);
+                }
+                Err(e) => {
+                    let _ = app_clone.emit(
+                        "agent_event",
+                        serde_json::json!({
+                            "session_id": session_id,
+                            "type": "error",
+                            "error": e.to_string(),
+                        }),
+                    );
+                    break;
                 }
             }
         }
-    }
 
-    // Remove from registry and wait for completion
-    let status = {
-        let mut processes = AGENT_PROCESSES.lock().await;
-        if let Some(mut child) = processes.remove(&session_id) {
-            child.wait().await.ok()
-        } else {
-            None
-        }
-    };
-
-    // Emit completion event
-    let _ = app.emit("agent_event", serde_json::json!({
-        "type": "session_ended",
-        "engine": engine,
-        "session_id": session_id,
-        "exit_code": status.and_then(|s| s.code()),
-    }));
+        // Emit session ended
+        let _ = app_clone.emit(
+            "agent_event",
+            serde_json::json!({
+                "session_id": session_id,
+                "type": "session_ended",
+            }),
+        );
+    });
 
     Ok(())
 }
+
+#[tauri::command]
+async fn stop_agent(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
+    let mut client = client::get_client().await?;
+    client
+        .stop_agent(proto::StopAgentRequest {
+            session_id: session_id.clone(),
+        })
+        .await
+        .map_err(map_err)?;
+
+    // Emit stopped event
+    let _ = app.emit(
+        "agent_event",
+        serde_json::json!({
+            "type": "session_stopped",
+            "session_id": session_id,
+        }),
+    );
+
+    Ok(())
+}
+
+// =============================================================================
+// Snapshot (kept local - macOS specific)
+// =============================================================================
 
 const SNAPSHOT_PATH: &str = "/tmp/conductor-snapshot.png";
 
@@ -340,7 +563,7 @@ async fn capture_snapshot(webview: tauri::Webview) -> Result<String, String> {
                             let bitmap_rep: id =
                                 msg_send![class!(NSBitmapImageRep), imageRepWithData:tiff_data];
                             let png_data: id =
-                                msg_send![bitmap_rep, representationUsingType:4 properties:nil]; // 4 = NSPNGFileType
+                                msg_send![bitmap_rep, representationUsingType:4 properties:nil];
 
                             let bytes: *const u8 = msg_send![png_data, bytes];
                             let length: usize = msg_send![png_data, length];
@@ -373,77 +596,12 @@ async fn capture_snapshot(webview: tauri::Webview) -> Result<String, String> {
     }
 }
 
-#[tauri::command]
-async fn stop_agent(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
-    let mut processes = AGENT_PROCESSES.lock().await;
-    if let Some(mut child) = processes.remove(&session_id) {
-        // Kill the process
-        child.kill().await.map_err(|e| format!("Failed to kill process: {e}"))?;
-
-        // Emit stopped event
-        let _ = app.emit("agent_event", serde_json::json!({
-            "type": "session_stopped",
-            "session_id": session_id,
-        }));
-
-        Ok(())
-    } else {
-        Err("No running agent with that session_id".to_string())
-    }
-}
-
 // =============================================================================
-// Session & Chat Persistence
+// Shell/PTY Commands (kept local - not moved to daemon)
 // =============================================================================
 
 #[tauri::command]
-fn session_read(workspace_path: String) -> Result<Option<SessionState>, String> {
-    let path = PathBuf::from(workspace_path);
-    core::session_read(&path).map_err(map_err)
-}
-
-#[tauri::command]
-fn session_create(workspace_path: String, agent_id: String) -> Result<SessionState, String> {
-    let path = PathBuf::from(workspace_path);
-    core::session_create(&path, &agent_id).map_err(map_err)
-}
-
-#[tauri::command]
-fn session_set_resume_id(workspace_path: String, resume_id: String) -> Result<SessionState, String> {
-    let path = PathBuf::from(workspace_path);
-    core::session_set_resume_id(&path, &resume_id).map_err(map_err)
-}
-
-#[tauri::command]
-fn session_upsert_resume_id(workspace_path: String, agent_id: String, resume_id: String) -> Result<SessionState, String> {
-    let path = PathBuf::from(workspace_path);
-    core::session_upsert_resume_id(&path, &agent_id, &resume_id).map_err(map_err)
-}
-
-#[tauri::command]
-fn chat_read(workspace_path: String) -> Result<String, String> {
-    let path = PathBuf::from(workspace_path);
-    core::chat_read(&path).map_err(map_err)
-}
-
-#[tauri::command]
-fn chat_append(workspace_path: String, role: String, content: String) -> Result<(), String> {
-    let path = PathBuf::from(workspace_path);
-    core::chat_append(&path, &role, &content).map_err(map_err)
-}
-
-#[tauri::command]
-fn chat_clear(workspace_path: String) -> Result<(), String> {
-    let path = PathBuf::from(workspace_path);
-    core::chat_clear(&path).map_err(map_err)
-}
-
-// =============================================================================
-// Shell/PTY Commands
-// =============================================================================
-
-#[tauri::command]
-async fn spawn_shell(app: tauri::AppHandle, cwd: String, session_id: String) -> Result<String, String> {
+async fn spawn_shell(app: tauri::AppHandle, cwd: String, _session_id: String) -> Result<String, String> {
     let shell_id = uuid::Uuid::new_v4().to_string();
     let pty_system = native_pty_system();
 
@@ -456,42 +614,52 @@ async fn spawn_shell(app: tauri::AppHandle, cwd: String, session_id: String) -> 
         })
         .map_err(|e| format!("Failed to open PTY: {e}"))?;
 
-    // Determine shell
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
 
     let mut cmd = CommandBuilder::new(&shell);
     cmd.cwd(&cwd);
 
-    // Spawn the shell
-    let _child = pair.slave.spawn_command(cmd).map_err(|e| format!("Failed to spawn shell: {e}"))?;
+    let _child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("Failed to spawn shell: {e}"))?;
 
-    // Get reader and writer
-    let mut reader = pair.master.try_clone_reader().map_err(|e| format!("Failed to clone reader: {e}"))?;
-    let writer = pair.master.take_writer().map_err(|e| format!("Failed to take writer: {e}"))?;
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("Failed to clone reader: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("Failed to take writer: {e}"))?;
 
-    // Store shell instance
     {
         let mut shells = SHELL_PROCESSES.lock().await;
-        shells.insert(shell_id.clone(), ShellInstance {
-            writer,
-            master: pair.master,
-        });
+        shells.insert(
+            shell_id.clone(),
+            ShellInstance {
+                writer,
+                master: pair.master,
+            },
+        );
     }
 
-    // Spawn reader task
     let shell_id_clone = shell_id.clone();
     let app_clone = app.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
-                Ok(0) => break, // EOF
+                Ok(0) => break,
                 Ok(n) => {
                     let data = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = app_clone.emit("shell_output", serde_json::json!({
-                        "shell_id": shell_id_clone,
-                        "data": data,
-                    }));
+                    let _ = app_clone.emit(
+                        "shell_output",
+                        serde_json::json!({
+                            "shell_id": shell_id_clone,
+                            "data": data,
+                        }),
+                    );
                 }
                 Err(_) => break,
             }
@@ -505,7 +673,10 @@ async fn spawn_shell(app: tauri::AppHandle, cwd: String, session_id: String) -> 
 async fn write_shell(shell_id: String, data: String) -> Result<(), String> {
     let mut shells = SHELL_PROCESSES.lock().await;
     if let Some(shell) = shells.get_mut(&shell_id) {
-        shell.writer.write_all(data.as_bytes()).map_err(|e| format!("Write failed: {e}"))?;
+        shell
+            .writer
+            .write_all(data.as_bytes())
+            .map_err(|e| format!("Write failed: {e}"))?;
         shell.writer.flush().map_err(|e| format!("Flush failed: {e}"))?;
         Ok(())
     } else {
@@ -517,12 +688,15 @@ async fn write_shell(shell_id: String, data: String) -> Result<(), String> {
 async fn resize_shell(shell_id: String, cols: u16, rows: u16) -> Result<(), String> {
     let shells = SHELL_PROCESSES.lock().await;
     if let Some(shell) = shells.get(&shell_id) {
-        shell.master.resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        }).map_err(|e| format!("Resize failed: {e}"))?;
+        shell
+            .master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("Resize failed: {e}"))?;
         Ok(())
     } else {
         Err("Shell not found".to_string())
@@ -538,6 +712,10 @@ async fn kill_shell(shell_id: String) -> Result<(), String> {
         Err("Shell not found".to_string())
     }
 }
+
+// =============================================================================
+// Tauri App Entry Point
+// =============================================================================
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -556,7 +734,6 @@ pub fn run() {
             workspace_file_content,
             workspace_file_diff,
             resolve_home_path,
-            parse_agent_lines,
             run_agent,
             stop_agent,
             capture_snapshot,
